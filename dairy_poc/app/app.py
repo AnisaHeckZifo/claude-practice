@@ -369,6 +369,23 @@ _ML_HIGH_THRESH:   float = 1.00  # run-level model score: High = at/above 95th-p
 _ML_TREND_WINDOW:  int   = 30    # sliding window width in minutes for the score trend chart
 _ML_TREND_STEP:    int   = 5     # step between successive windows in minutes
 
+# Product-aware cosine-similarity weights: [mean, std, range, slope] × 4 signals (16 values)
+# QUARK signal order: pH, temperature_C, separator_speed_rpm, separation_deltaP
+_QUARK_SIM_WEIGHTS: np.ndarray = np.array([
+    2.0, 2.0, 2.0, 2.0,   # pH — primary fermentation quality indicator
+    1.5, 1.5, 1.5, 1.5,   # temperature_C — process control
+    0.5, 0.5, 0.5, 0.5,   # separator_speed_rpm — separation step only
+    0.5, 0.5, 0.5, 0.5,   # separation_deltaP — separation step only
+])
+
+# PUDDING signal order: temperature_C, pressure_bar, deltaT_heat_exchanger, flow_rate_lpm
+_PUDDING_SIM_WEIGHTS: np.ndarray = np.array([
+    1.5, 1.5, 1.5, 1.5,   # temperature_C
+    2.0, 2.0, 2.0, 2.0,   # pressure_bar — fouling-sensitive
+    2.0, 2.0, 2.0, 2.0,   # deltaT_heat_exchanger — primary fouling signal
+    1.5, 1.5, 1.5, 1.5,   # flow_rate_lpm
+])
+
 
 def _extract_run_summary(
     run_ts:  pd.DataFrame,
@@ -937,6 +954,177 @@ def _render_score_trend_chart(
 
 
 # =============================================================================
+# SIMILAR RUNS  (cosine similarity on product-aware run feature vectors)
+# =============================================================================
+
+@st.cache_data
+def _build_similarity_vectors(
+    _ts:   pd.DataFrame,
+    _runs: pd.DataFrame,
+) -> dict[str, np.ndarray]:
+    """Weighted feature vector per run_id for cosine similarity.
+
+    Reuses _extract_run_summary (16-dim: [mean, std, range, slope] × 4 signals)
+    then applies product-specific signal weights so fermentation signals dominate
+    for QUARK and heat-exchanger signals dominate for PUDDING.
+
+    Returns {} when all runs lack timeseries data.
+    """
+    result: dict[str, np.ndarray] = {}
+    for product, signals, weights in [
+        ("QUARK",                _QUARK_SIGNALS,  _QUARK_SIM_WEIGHTS),
+        ("HIGH_PROTEIN_PUDDING", _PUDDING_SIGNALS, _PUDDING_SIM_WEIGHTS),
+    ]:
+        prod_run_ids = _runs.loc[_runs["product"] == product, "run_id"].tolist()
+        for rid in prod_run_ids:
+            run_ts = _ts[_ts["run_id"] == rid]
+            if run_ts.empty:
+                continue
+            feats = np.array(_extract_run_summary(run_ts, signals), dtype=float)
+            feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+            result[rid] = feats * weights
+    return result
+
+
+def _compute_similar_runs(
+    target_run_id: str,
+    runs:          pd.DataFrame,
+    sim_vectors:   dict[str, np.ndarray],
+    top_n:         int = 5,
+) -> list[dict]:
+    """Top-N most similar runs by cosine similarity, same product only.
+
+    Adds a 0.05 boost to runs on the same scale before ranking so that
+    same-scale runs are preferred when similarity scores are close.
+    Caps displayed similarity at 1.0 after the boost.
+    """
+    if target_run_id not in sim_vectors:
+        return []
+    target_vec = sim_vectors[target_run_id]
+    norm_t = float(np.linalg.norm(target_vec))
+
+    target_meta = runs[runs["run_id"] == target_run_id]
+    if target_meta.empty:
+        return []
+    target_meta    = target_meta.iloc[0]
+    target_product = target_meta["product"]
+    target_scale   = target_meta["scale"]
+
+    results: list[dict] = []
+    for rid, vec in sim_vectors.items():
+        if rid == target_run_id:
+            continue
+        run_meta = runs[runs["run_id"] == rid]
+        if run_meta.empty or run_meta.iloc[0]["product"] != target_product:
+            continue
+        run_meta = run_meta.iloc[0]
+
+        norm_v = float(np.linalg.norm(vec))
+        sim = float(np.dot(target_vec, vec) / (norm_t * norm_v)) if (norm_t > 1e-9 and norm_v > 1e-9) else 0.0
+        if run_meta["scale"] == target_scale:
+            sim += 0.05
+
+        results.append({
+            "run_id":           rid,
+            "scenario":         run_meta["scenario"],
+            "scale":            run_meta["scale"],
+            "similarity":       min(sim, 1.0),
+            "downtime_minutes": float(run_meta["downtime_minutes"]),
+            "yield_loss_pct":   float(run_meta["yield_loss_pct"]),
+            "extra_cleaning":   bool(run_meta["extra_cleaning"]),
+            "fouling_grade":    str(run_meta["fouling_grade"]),
+        })
+
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    return results[:top_n]
+
+
+def _on_open_similar_run(
+    target_run_id:  str,
+    target_product: str,
+    current_mode:   str,
+    demo_cases:     dict,
+) -> None:
+    """on_click callback for the 'Open' button in the Similar Runs panel.
+
+    Guided mode + run in demo_cases.json → stay guided, jump to that story.
+    All other cases → switch to Explore mode for the target run.
+    """
+    stories   = demo_cases.get("stories", [])
+    story_ids = [s["run_id"] for s in stories]
+    _clear_run_widgets(target_run_id)
+
+    if current_mode == "guided" and target_run_id in story_ids:
+        st.session_state["guided_idx"] = story_ids.index(target_run_id)
+    else:
+        st.session_state["app_mode"]          = "Explore all runs"
+        st.session_state["explore_product"]   = target_product
+        st.session_state["explore_scenario"]  = "(all)"
+        st.session_state["explore_run"]       = target_run_id
+
+
+def _render_similar_runs_panel(
+    run_id:     str,
+    mode:       str,
+    runs:       pd.DataFrame,
+    ts:         pd.DataFrame,
+    demo_cases: dict,
+) -> None:
+    """Cosine-similarity case-based reasoning panel in the right column."""
+    st.subheader("Similar runs")
+
+    sim_vectors = _build_similarity_vectors(ts, runs)
+    if not sim_vectors:
+        st.caption("Similarity data unavailable.")
+        return
+
+    similar = _compute_similar_runs(run_id, runs, sim_vectors)
+    if not similar:
+        st.caption("No similar runs found for this product.")
+        return
+
+    target_product = runs.loc[runs["run_id"] == run_id, "product"].iloc[0]
+
+    with st.container(border=True):
+        for sr in similar:
+            sim_pct = int(sr["similarity"] * 100)
+            col_info, col_btn = st.columns([3, 1])
+            with col_info:
+                st.markdown(
+                    f"**{sr['run_id']}** · {sr['scenario']} · {sr['scale']}  \n"
+                    f"Similarity: **{sim_pct}%**  ·  "
+                    f"Downtime: {sr['downtime_minutes']:.0f} min  ·  "
+                    f"Yield loss: {sr['yield_loss_pct']:.1f}%"
+                )
+                badges: list[str] = []
+                if sr["extra_cleaning"]:
+                    badges.append("extra CIP")
+                if sr["fouling_grade"] not in ("NONE", "nan", ""):
+                    badges.append(f"fouling: {sr['fouling_grade']}")
+                if badges:
+                    st.caption("  ·  ".join(badges))
+            with col_btn:
+                st.button(
+                    "Open",
+                    key=f"open_sim_{run_id}_{sr['run_id']}",
+                    on_click=_on_open_similar_run,
+                    kwargs={
+                        "target_run_id":  sr["run_id"],
+                        "target_product": target_product,
+                        "current_mode":   mode,
+                        "demo_cases":     demo_cases,
+                    },
+                    use_container_width=True,
+                )
+            st.divider()
+
+        st.caption(
+            "Similarity is pattern-based (helps investigation); "
+            "it does not imply root cause."
+        )
+
+
+# =============================================================================
 # SIDEBAR — mode toggle + selectors
 # =============================================================================
 
@@ -957,7 +1145,7 @@ def render_sidebar(
     mode = st.sidebar.radio(
         "Mode",
         options=["Guided story mode", "Explore all runs"],
-        index=0,
+        key="app_mode",
         help=(
             "Guided: step through curated demo cases with process narratives.\n"
             "Explore: browse any run in the dataset."
@@ -1044,8 +1232,25 @@ def _sidebar_guided(demo_cases: dict) -> str | None:
     return stories[idx]["run_id"]
 
 
+def _on_explore_product_change() -> None:
+    """Clear downstream keys when the user manually changes the product."""
+    st.session_state.pop("explore_scenario", None)
+    st.session_state.pop("explore_run", None)
+
+
+def _on_explore_scenario_change() -> None:
+    """Clear run key when the user manually changes the scenario."""
+    st.session_state.pop("explore_run", None)
+
+
 def _sidebar_explore(runs: pd.DataFrame) -> str | None:
-    """Explore-mode sidebar: cascading product → scenario → run selectors."""
+    """Explore-mode sidebar: cascading product → scenario → run selectors.
+
+    All three selectboxes are keyed so that _on_open_similar_run can
+    programmatically navigate by setting st.session_state before the rerun.
+    on_change callbacks clear downstream keys when the user changes a selector
+    manually, preventing stale values from causing invalid-option errors.
+    """
     products = sorted(runs["product"].unique())
     product_display = {p: p.replace("HIGH_PROTEIN_PUDDING", "High-Protein Pudding") for p in products}
 
@@ -1053,11 +1258,24 @@ def _sidebar_explore(runs: pd.DataFrame) -> str | None:
         "Product",
         options=products,
         format_func=lambda p: product_display[p],
+        key="explore_product",
+        on_change=_on_explore_product_change,
     )
 
     filtered_by_product = runs[runs["product"] == sel_product]
     scenarios = ["(all)"] + sorted(filtered_by_product["scenario"].unique())
-    sel_scenario = st.sidebar.selectbox("Scenario", options=scenarios)
+
+    # Guard: if session_state holds a scenario that isn't valid for the current
+    # product (e.g., after a programmatic product switch), reset it.
+    if st.session_state.get("explore_scenario") not in scenarios:
+        st.session_state["explore_scenario"] = "(all)"
+
+    sel_scenario = st.sidebar.selectbox(
+        "Scenario",
+        options=scenarios,
+        key="explore_scenario",
+        on_change=_on_explore_scenario_change,
+    )
 
     if sel_scenario == "(all)":
         filtered = filtered_by_product
@@ -1068,14 +1286,21 @@ def _sidebar_explore(runs: pd.DataFrame) -> str | None:
         st.sidebar.info("No runs match the current filters.")
         return None
 
+    run_list = list(filtered.sort_values("run_id")["run_id"])
     run_labels = {
         row["run_id"]: f"{row['run_id']}  ·  {row['scenario']}  ·  {row['scale']}"
         for _, row in filtered.sort_values("run_id").iterrows()
     }
+
+    # Guard: if session_state holds a run that isn't in the filtered list reset it.
+    if st.session_state.get("explore_run") not in run_list:
+        st.session_state["explore_run"] = run_list[0]
+
     sel_run = st.sidebar.selectbox(
         "Run",
-        options=list(run_labels.keys()),
+        options=run_list,
         format_func=lambda rid: run_labels[rid],
+        key="explore_run",
     )
     return sel_run
 
@@ -1155,6 +1380,7 @@ def render_main(
             _render_divergence_panel(
                 run_ts, df_baseline, run_row["product"], x_range, selected_step,
             )
+        _render_similar_runs_panel(run_id, mode, runs, ts, demo_cases)
 
 
 # ── Run header ────────────────────────────────────────────────────────────────
