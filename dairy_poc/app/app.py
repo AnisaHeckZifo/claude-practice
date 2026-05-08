@@ -364,10 +364,20 @@ def render_signal_charts(
 
 _ML_WINDOW:        int   = 10    # rolling window for slope/std features (minutes)
 _ML_THRESHOLD_PCT: float = 95.0  # percentile of NORMAL scores used as alert level
-_ML_WATCH_THRESH:  float = 0.90  # run-level model score: Watch starts here (calibrated)
-_ML_HIGH_THRESH:   float = 1.00  # run-level model score: High = at/above 95th-pct NORMAL
+_ML_WATCH_THRESH:  float = 0.90  # normalised score: Watch starts here
+_ML_HIGH_THRESH:   float = 1.00  # normalised score: High = at/above 95th-pct NORMAL
 _ML_TREND_WINDOW:  int   = 30    # sliding window width in minutes for the score trend chart
 _ML_TREND_STEP:    int   = 5     # step between successive windows in minutes
+
+# QUARK step + signal partitioning — keeps fermentation and separation models completely
+# independent, eliminating false positives from the zero-to-active step boundary.
+_QUARK_ML_FERM_STEPS:   frozenset[str] = frozenset({
+    "inoculation_mixing", "early_fermentation", "late_fermentation",
+})
+_QUARK_ML_SEP_STEP:     str   = "separation"
+_QUARK_ML_SPEED_THRESH: float = 1000.0  # rpm; below = centrifuge ramp-up, excluded from sep model
+_QUARK_ML_PH_HI:        float = 5.2     # pH threshold: frac below this measures ferm progress
+_QUARK_ML_PH_LO:        float = 4.6     # pH threshold: frac below this measures ferm completion
 
 # Product-aware cosine-similarity weights: [mean, std, range, slope] × 4 signals (16 values)
 # QUARK signal order: pH, temperature_C, separator_speed_rpm, separation_deltaP
@@ -435,13 +445,100 @@ def _extract_ml_features(
     return pd.DataFrame(cols, index=df_ts.index)
 
 
+def _extract_quark_ferm_features(run_ts: pd.DataFrame) -> list[float]:
+    """6-dim fermentation health vector for one QUARK run (fermentation steps only).
+
+    Only uses pH over inoculation_mixing + early_fermentation + late_fermentation.
+    Separation signals never enter this vector, so zero-to-active step boundaries
+    cannot affect fermentation scores.
+
+    Features:
+      [pH_mean, late_ferm_slope, pH_min, pH_range, frac_below_5.2, frac_below_4.6]
+
+    Returns [0.0]*6 when fewer than 10 valid pH rows are found.
+    """
+    if "step" not in run_ts.columns:
+        return [0.0] * 6
+    ferm = run_ts[run_ts["step"].isin(_QUARK_ML_FERM_STEPS)]
+    late = run_ts[run_ts["step"] == "late_fermentation"]
+
+    ph = ferm["pH"].dropna() if "pH" in ferm.columns else pd.Series(dtype=float)
+    if len(ph) < 10:
+        return [0.0] * 6
+
+    t_all = ferm.loc[ph.index, "t_min"].values.astype(float)
+    v_all = ph.values.astype(float)
+
+    ph_late = late["pH"].dropna() if "pH" in late.columns else pd.Series(dtype=float)
+    t_late  = late.loc[ph_late.index, "t_min"].values.astype(float) if not ph_late.empty else np.array([])
+    v_late  = ph_late.values.astype(float)
+    late_slope = (
+        float(np.polyfit(t_late, v_late, 1)[0]) if len(v_late) > 3
+        else float(np.polyfit(t_all,  v_all,  1)[0])
+    )
+
+    return [
+        float(v_all.mean()),
+        late_slope,
+        float(v_all.min()),
+        float(v_all.max() - v_all.min()),
+        float((v_all < _QUARK_ML_PH_HI).mean()),
+        float((v_all < _QUARK_ML_PH_LO).mean()),
+    ]
+
+
+def _extract_quark_sep_features(run_ts: pd.DataFrame) -> list[float]:
+    """6-dim separation stability vector (steady-state separation rows only).
+
+    Filters to rows where separator_speed_rpm > _QUARK_ML_SPEED_THRESH to exclude the
+    centrifuge ramp-up phase, which activates from zero at the step boundary and would
+    otherwise create false anomaly signals.
+
+    Features:
+      [deltaP_mean, deltaP_std, deltaP_max, deltaP_slope, speed_mean, speed_std]
+
+    Returns [0.0]*6 when fewer than 5 valid rows are found.
+    """
+    if "step" not in run_ts.columns:
+        return [0.0] * 6
+    sep = run_ts[
+        (run_ts["step"] == _QUARK_ML_SEP_STEP) &
+        (run_ts["separator_speed_rpm"].fillna(0.0) > _QUARK_ML_SPEED_THRESH)
+    ]
+    dp = sep["separation_deltaP"].dropna() if "separation_deltaP" in sep.columns else pd.Series(dtype=float)
+    if len(dp) < 5:
+        return [0.0] * 6
+
+    t    = sep.loc[dp.index, "t_min"].values.astype(float)
+    v_dp = dp.values.astype(float)
+    v_sp = sep.loc[dp.index, "separator_speed_rpm"].fillna(0.0).values.astype(float)
+    dp_slope = float(np.polyfit(t, v_dp, 1)[0]) if len(t) > 3 else 0.0
+
+    return [
+        float(v_dp.mean()),
+        float(v_dp.std()),
+        float(v_dp.max()),
+        dp_slope,
+        float(v_sp.mean()),
+        float(v_sp.std()),
+    ]
+
+
 @st.cache_resource
 def _load_ml_models() -> dict:
-    """Train one IsolationForest per product on all NORMAL runs.
+    """Train product-aware IsolationForest models on NORMAL runs.
+
+    QUARK — four step-scoped models:
+      ferm_run_pipeline / ferm_run_threshold  run-level Fermentation Health (6 features)
+      sep_run_pipeline  / sep_run_threshold   run-level Separation Stability (6 features)
+      ferm_row_pipeline / ferm_row_threshold  row-level ferm (pH+temp, ferm steps only)
+      sep_row_pipeline  / sep_row_threshold   row-level sep  (ΔP+speed, steady sep only)
+
+    HIGH_PROTEIN_PUDDING — two models (unchanged):
+      pipeline     / threshold      row-level, all signals
+      run_pipeline / run_threshold  run-level, all signals
 
     Uses @st.cache_resource so training runs once per app-server start.
-    Restart the app to pick up new training data.
-    Returns {} when scikit-learn is unavailable or data is insufficient.
     """
     if not _SKLEARN_AVAILABLE:
         return {}
@@ -451,194 +548,89 @@ def _load_ml_models() -> dict:
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
-    runs_df = pd.read_csv(_RAW / "runs.csv")
-    ts_df   = pd.read_csv(_RAW / "timeseries.csv")
-
-    models: dict = {}
-    for product, signals in [
-        ("QUARK",                _QUARK_SIGNALS),
-        ("HIGH_PROTEIN_PUDDING", _PUDDING_SIGNALS),
-    ]:
-        normal_ids = runs_df.loc[
-            (runs_df["product"] == product) & (runs_df["scenario"] == "NORMAL"), "run_id"
-        ]
-        normal_ts = ts_df[ts_df["run_id"].isin(normal_ids)]
-        if normal_ts.empty:
-            continue
-
-        feat_df = _extract_ml_features(normal_ts, signals)
-        X       = feat_df.values.astype(float)
-
-        pipe = Pipeline([
+    def _make_pipe() -> Pipeline:
+        return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler",  StandardScaler()),
-            ("iso",     IsolationForest(
-                n_estimators=100, contamination="auto", random_state=42,
-            )),
+            ("iso",     IsolationForest(n_estimators=100, contamination="auto", random_state=42)),
         ])
+
+    def _fit_thr(pipe: Pipeline, X: np.ndarray) -> float:
         pipe.fit(X)
+        return float(np.percentile((-pipe.score_samples(X)).clip(min=0), _ML_THRESHOLD_PCT))
 
-        # Alert threshold = Nth-percentile anomaly score on the training data
-        normal_scores = (-pipe.score_samples(X)).clip(min=0)
-        threshold     = float(np.percentile(normal_scores, _ML_THRESHOLD_PCT))
+    runs_df = pd.read_csv(_RAW / "runs.csv")
+    ts_df   = pd.read_csv(_RAW / "timeseries.csv")
+    models: dict = {}
 
-        models[product] = {"pipeline": pipe, "threshold": threshold}
+    # ── QUARK: step-scoped, product-aware models ──────────────────────────────
+    q_ids = runs_df.loc[
+        (runs_df["product"] == "QUARK") & (runs_df["scenario"] == "NORMAL"), "run_id"
+    ]
+    q_ts = ts_df[ts_df["run_id"].isin(q_ids)]
 
-        # --- Run-level model: one summary vector per normal run ---
-        summaries = [
-            _extract_run_summary(ts_df[ts_df["run_id"] == rid], signals)
-            for rid in normal_ids
+    if not q_ts.empty:
+        models["QUARK"] = {}
+
+        # Run-level Fermentation Health
+        fv = [_extract_quark_ferm_features(ts_df[ts_df["run_id"] == r]) for r in q_ids]
+        if len(fv) >= 5:
+            Xf = np.array(fv, dtype=float)
+            p = _make_pipe()
+            models["QUARK"]["ferm_run_pipeline"]  = p
+            models["QUARK"]["ferm_run_threshold"] = _fit_thr(p, Xf)
+
+        # Run-level Separation Stability
+        sv = [_extract_quark_sep_features(ts_df[ts_df["run_id"] == r]) for r in q_ids]
+        if len(sv) >= 5:
+            Xs = np.array(sv, dtype=float)
+            p = _make_pipe()
+            models["QUARK"]["sep_run_pipeline"]  = p
+            models["QUARK"]["sep_run_threshold"] = _fit_thr(p, Xs)
+
+        # Row-level Fermentation (pH + temperature, fermentation steps only)
+        ferm_rows = q_ts[q_ts["step"].isin(_QUARK_ML_FERM_STEPS)]
+        ferm_sigs = [s for s in _QUARK_SIGNALS if s[0] in ("pH", "temperature_C")]
+        if not ferm_rows.empty:
+            Xfr = _extract_ml_features(ferm_rows, ferm_sigs).values.astype(float)
+            p = _make_pipe()
+            models["QUARK"]["ferm_row_pipeline"]  = p
+            models["QUARK"]["ferm_row_threshold"] = _fit_thr(p, Xfr)
+
+        # Row-level Separation (ΔP + speed, steady-state rows only)
+        sep_rows = q_ts[
+            (q_ts["step"] == _QUARK_ML_SEP_STEP) &
+            (q_ts["separator_speed_rpm"].fillna(0.0) > _QUARK_ML_SPEED_THRESH)
         ]
+        sep_sigs = [s for s in _QUARK_SIGNALS if s[0] in ("separation_deltaP", "separator_speed_rpm")]
+        if not sep_rows.empty:
+            Xsr = _extract_ml_features(sep_rows, sep_sigs).values.astype(float)
+            p = _make_pipe()
+            models["QUARK"]["sep_row_pipeline"]  = p
+            models["QUARK"]["sep_row_threshold"] = _fit_thr(p, Xsr)
+
+    # ── HIGH_PROTEIN_PUDDING: unchanged ───────────────────────────────────────
+    p_ids = runs_df.loc[
+        (runs_df["product"] == "HIGH_PROTEIN_PUDDING") & (runs_df["scenario"] == "NORMAL"), "run_id"
+    ]
+    p_ts = ts_df[ts_df["run_id"].isin(p_ids)]
+
+    if not p_ts.empty:
+        signals = _PUDDING_SIGNALS
+        Xp = _extract_ml_features(p_ts, signals).values.astype(float)
+        p = _make_pipe()
+        models["HIGH_PROTEIN_PUDDING"] = {
+            "pipeline":  p,
+            "threshold": _fit_thr(p, Xp),
+        }
+        summaries = [_extract_run_summary(ts_df[ts_df["run_id"] == r], signals) for r in p_ids]
         if len(summaries) >= 5:
             Xr = np.array(summaries, dtype=float)
-            run_pipe = Pipeline([
-                ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-                ("scaler",  StandardScaler()),
-                ("iso",     IsolationForest(
-                    n_estimators=100, contamination="auto", random_state=42,
-                )),
-            ])
-            run_pipe.fit(Xr)
-            run_scores  = (-run_pipe.score_samples(Xr)).clip(min=0)
-            run_thr     = float(np.percentile(run_scores, _ML_THRESHOLD_PCT))
-            models[product]["run_pipeline"]  = run_pipe
-            models[product]["run_threshold"] = run_thr
+            rp = _make_pipe()
+            models["HIGH_PROTEIN_PUDDING"]["run_pipeline"]  = rp
+            models["HIGH_PROTEIN_PUDDING"]["run_threshold"] = _fit_thr(rp, Xr)
 
     return models
-
-
-def _render_ml_warning(
-    df_run:        pd.DataFrame,
-    product:       str,
-    x_range:       tuple[float, float] | None,
-    selected_step: str,
-    run_id:        str,
-) -> None:
-    """Toggle-gated anomaly score chart with first-exceedance marker.
-
-    Scores the full run for proper rolling context, then clips the display to
-    the current zoom window.  Does not imply causality.
-    """
-    show = st.checkbox(
-        "Show ML-assisted early warning",
-        key=f"ml_warning_{run_id}",
-    )
-    if not show:
-        return
-
-    if not _SKLEARN_AVAILABLE:
-        st.warning(
-            "scikit-learn is required for ML early warning.  "
-            "Install it with:  "
-            "`uv pip install scikit-learn --python .venv/Scripts/python.exe`"
-        )
-        return
-
-    if df_run.empty:
-        return
-
-    models = _load_ml_models()
-    if product not in models:
-        st.caption("ML model not available for this product.")
-        return
-
-    m         = models[product]
-    pipe      = m["pipeline"]
-    threshold = m["threshold"]
-    signals   = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
-
-    # Score the full run (preserves rolling context at step boundaries)
-    feat_df     = _extract_ml_features(df_run, signals)
-    X           = feat_df.values.astype(float)
-    raw_scores  = (-pipe.score_samples(X)).clip(min=0)
-    # Normalise so the alert threshold sits at y = 1.0
-    norm_scores = raw_scores / max(threshold, 1e-9)
-    t_arr       = df_run["t_min"].values
-
-    # Clip display to the current zoom window
-    if x_range is not None:
-        lo, hi = x_range
-        mask = (t_arr >= lo) & (t_arr <= hi)
-    else:
-        mask = np.ones(len(t_arr), dtype=bool)
-
-    t_vis     = t_arr[mask]
-    score_vis = norm_scores[mask]
-    if len(t_vis) == 0:
-        return
-
-    # First timepoint in the visible window where score exceeds the threshold
-    exceed          = score_vis > 1.0
-    first_t: float | None = float(t_vis[exceed][0]) if exceed.any() else None
-    first_step_lbl: str | None = None
-    if first_t is not None:
-        sr = df_run[(df_run["t_min"] - first_t).abs() < 0.5]
-        if not sr.empty:
-            first_step_lbl = sr["step"].iloc[0].replace("_", " ")
-
-    # ── Chart ─────────────────────────────────────────────────────────────────
-    st.subheader("ML-assisted early warning")
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=t_vis, y=score_vis,
-        mode="lines",
-        line=dict(color="#FF9800", width=1.5),
-        fill="tozeroy",
-        fillcolor="rgba(255,152,0,0.08)",
-        hovertemplate="t = %{x:.1f} min<br>Score = %{y:.2f}× threshold<extra></extra>",
-        showlegend=False,
-    ))
-    fig.add_hline(
-        y=1.0,
-        line_dash="dash", line_color="#E53935", line_width=1.5,
-        annotation_text="Alert threshold",
-        annotation_position="top right",
-        annotation_font_size=9, annotation_font_color="#E53935",
-    )
-    if first_t is not None:
-        fig.add_vline(
-            x=first_t, line_dash="dot", line_color="#E53935", line_width=1.5,
-        )
-        fig.add_annotation(
-            x=first_t,
-            y=max(float(score_vis.max()), 1.15),
-            text=f"t = {first_t:.0f}",
-            showarrow=False,
-            font=dict(size=9, color="#E53935"),
-            xanchor="left",
-        )
-    fig.update_layout(
-        height=135,
-        margin=dict(l=8, r=8, t=4, b=36),
-        xaxis=dict(title="t (min)", showgrid=True, gridcolor="#ebebeb", zeroline=False),
-        yaxis=dict(
-            title="Score (× threshold)",
-            showgrid=True, gridcolor="#ebebeb", zeroline=False,
-            range=[0, max(float(score_vis.max()) * 1.1, 1.5)],
-        ),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-    )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-    # ── Explanatory text ──────────────────────────────────────────────────────
-    if first_t is not None:
-        step_clause = f" (step: *{first_step_lbl}*)" if first_step_lbl else ""
-        st.warning(
-            f"ML-assisted early warning: unusual pattern begins around "
-            f"**t = {first_t:.0f} min**{step_clause}.  "
-            f"This does not imply a root cause — it indicates the sensor-signal "
-            f"combination is unusual relative to NORMAL runs."
-        )
-    else:
-        st.success("No anomaly detected above the alert threshold in this window.")
-
-    st.caption(
-        "Model: IsolationForest trained on NORMAL runs only (one model per product).  "
-        "Score > 1.0 = sensor pattern unusual vs reference behaviour.  "
-        "Observational signal only — not a diagnosis."
-    )
 
 
 def _compute_score_trend(
@@ -674,53 +666,128 @@ def _compute_score_trend(
     return np.array(t_ends, dtype=float), np.array(scores, dtype=float)
 
 
-def _compute_ml_run_score(
-    df_run:  pd.DataFrame,
-    product: str,
-) -> tuple[float, float] | None:
-    """Single normalised run-level anomaly score using per-run summary features.
+# ── Scoring helpers ───────────────────────────────────────────────────────────
 
-    The run-level IsolationForest is trained on [mean, std, range, slope] per signal
-    across the full run — one vector per normal run.  This avoids the aggregation
-    instability of per-row scores.
+def _score_status(score: float) -> tuple[str, str]:
+    """(status_label, badge_text) for a normalised anomaly score."""
+    if score < _ML_WATCH_THRESH:
+        return "Normal", "✅ Normal"
+    if score < _ML_HIGH_THRESH:
+        return "Watch", "⚠️ Watch"
+    return "High", "🚨 High Risk"
 
-    Returns (normalized_score, run_threshold).  Score >= 1.0 means the run profile
-    is as unusual as the 95th-pct normal run.
-    Returns None when sklearn is unavailable or the product has no run-level model.
-    """
+
+_STATUS_FN = {"Normal": st.success, "Watch": st.warning, "High": st.error}
+
+
+def _compute_quark_ferm_score(df_run: pd.DataFrame) -> tuple[float, float] | None:
+    """Normalised QUARK Fermentation Health score.  Returns (score, threshold) or None."""
     if not _SKLEARN_AVAILABLE:
         return None
-    models = _load_ml_models()
-    m = models.get(product)
+    m = _load_ml_models().get("QUARK")
+    if m is None or "ferm_run_pipeline" not in m:
+        return None
+    feats = np.array([_extract_quark_ferm_features(df_run)], dtype=float)
+    raw   = float((-m["ferm_run_pipeline"].score_samples(feats)).clip(min=0)[0])
+    return raw / max(m["ferm_run_threshold"], 1e-9), m["ferm_run_threshold"]
+
+
+def _compute_quark_sep_score(df_run: pd.DataFrame) -> tuple[float, float] | None:
+    """Normalised QUARK Separation Stability score.  Returns (score, threshold) or None."""
+    if not _SKLEARN_AVAILABLE:
+        return None
+    m = _load_ml_models().get("QUARK")
+    if m is None or "sep_run_pipeline" not in m:
+        return None
+    feats = np.array([_extract_quark_sep_features(df_run)], dtype=float)
+    raw   = float((-m["sep_run_pipeline"].score_samples(feats)).clip(min=0)[0])
+    return raw / max(m["sep_run_threshold"], 1e-9), m["sep_run_threshold"]
+
+
+def _compute_ml_run_score(df_run: pd.DataFrame, product: str) -> tuple[float, float] | None:
+    """Normalised run-level score for PUDDING (single run-level model, all signals)."""
+    if not _SKLEARN_AVAILABLE:
+        return None
+    m = _load_ml_models().get(product)
     if m is None or "run_pipeline" not in m:
         return None
-    signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
-    feats   = np.array([_extract_run_summary(df_run, signals)], dtype=float)
-    raw     = float((-m["run_pipeline"].score_samples(feats)).clip(min=0)[0])
-    norm    = raw / max(float(m["run_threshold"]), 1e-9)
-    return norm, float(m["run_threshold"])
+    feats = np.array([_extract_run_summary(df_run, _PUDDING_SIGNALS)], dtype=float)
+    raw   = float((-m["run_pipeline"].score_samples(feats)).clip(min=0)[0])
+    return raw / max(m["run_threshold"], 1e-9), m["run_threshold"]
 
 
-def _compute_ml_row_scores(
-    df_ts:   pd.DataFrame,
-    product: str,
-) -> np.ndarray | None:
-    """Per-row normalised scores from the row-level model.  Used for step drill-down.
+def _compute_ml_row_scores(df_ts: pd.DataFrame, product: str) -> np.ndarray | None:
+    """Per-row normalised scores for PUDDING (row-level, all signals)."""
+    if not _SKLEARN_AVAILABLE:
+        return None
+    m = _load_ml_models().get(product)
+    if m is None or "pipeline" not in m:
+        return None
+    X   = _extract_ml_features(df_ts, _PUDDING_SIGNALS).values.astype(float)
+    raw = (-m["pipeline"].score_samples(X)).clip(min=0)
+    return raw / max(float(m["threshold"]), 1e-9)
 
-    Returns a numpy array aligned with df_ts rows, or None if unavailable.
+
+def _compute_quark_ferm_row_scores(
+    df_run: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Per-row Fermentation Health scores aligned to df_run index.
+
+    Returns (t_arr, scores) where scores is NaN for rows outside fermentation steps.
+    Only pH + temperature signals; only _QUARK_ML_FERM_STEPS rows are scored.
     """
     if not _SKLEARN_AVAILABLE:
         return None
-    models = _load_ml_models()
-    m = models.get(product)
-    if m is None:
+    m = _load_ml_models().get("QUARK")
+    if m is None or "ferm_row_pipeline" not in m:
         return None
-    signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
-    feat_df = _extract_ml_features(df_ts, signals)
-    X       = feat_df.values.astype(float)
-    raw     = (-m["pipeline"].score_samples(X)).clip(min=0)
-    return raw / max(float(m["threshold"]), 1e-9)
+    if "step" not in df_run.columns:
+        return None
+    ferm_mask = df_run["step"].isin(_QUARK_ML_FERM_STEPS)
+    ferm_rows = df_run[ferm_mask]
+    if ferm_rows.empty:
+        return None
+    sigs = [s for s in _QUARK_SIGNALS if s[0] in ("pH", "temperature_C")]
+    X    = _extract_ml_features(ferm_rows, sigs).values.astype(float)
+    raw  = (-m["ferm_row_pipeline"].score_samples(X)).clip(min=0)
+    norm = raw / max(float(m["ferm_row_threshold"]), 1e-9)
+    out  = np.full(len(df_run), np.nan)
+    out[ferm_mask.values] = norm
+    return df_run["t_min"].values.astype(float), out
 
+
+def _compute_quark_sep_row_scores(
+    df_run: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Per-row Separation Stability scores aligned to df_run index.
+
+    Returns (t_arr, scores) where scores is NaN for ramp-up or non-separation rows.
+    Only ΔP + speed signals; only steady-state separation rows are scored.
+    """
+    if not _SKLEARN_AVAILABLE:
+        return None
+    m = _load_ml_models().get("QUARK")
+    if m is None or "sep_row_pipeline" not in m:
+        return None
+    if "step" not in df_run.columns:
+        return None
+    steady_mask = (
+        (df_run["step"] == _QUARK_ML_SEP_STEP) &
+        (df_run["separator_speed_rpm"].fillna(0.0) > _QUARK_ML_SPEED_THRESH)
+    )
+    steady_rows = df_run[steady_mask]
+    if steady_rows.empty:
+        return None
+    sigs = [s for s in _QUARK_SIGNALS if s[0] in ("separation_deltaP", "separator_speed_rpm")]
+    X    = _extract_ml_features(steady_rows, sigs).values.astype(float)
+    raw  = (-m["sep_row_pipeline"].score_samples(X)).clip(min=0)
+    norm = raw / max(float(m["sep_row_threshold"]), 1e-9)
+    out  = np.full(len(df_run), np.nan)
+    out[steady_mask.values] = norm
+    return df_run["t_min"].values.astype(float), out
+
+
+# ── ML score panel ────────────────────────────────────────────────────────────
 
 def _render_ml_score_panel(
     df_run:        pd.DataFrame,
@@ -729,132 +796,119 @@ def _render_ml_score_panel(
     selected_step: str,
     run_id:        str,
 ) -> None:
-    """Always-visible ML Early Warning summary panel, rendered above signal charts.
+    """Always-visible ML Early Warning panel, product-aware.
 
-    Uses a run-level IsolationForest (per-run summary features) for the main score.
-    When a step is zoomed, also shows the mean row-level anomaly score for that step.
+    QUARK: two side-by-side metric cards — Fermentation Health + Separation Stability.
+    PUDDING: single metric card (unchanged).
     """
     st.subheader("ML Early Warning")
 
     if not _SKLEARN_AVAILABLE:
         st.caption("scikit-learn not installed — ML early warning unavailable.")
         return
-
     if df_run.empty:
         return
 
+    if product == "QUARK":
+        _render_quark_ml_cards(df_run)
+    else:
+        _render_pudding_ml_card(df_run, product, selected_step)
+
+
+def _render_quark_ml_cards(df_run: pd.DataFrame) -> None:
+    ferm = _compute_quark_ferm_score(df_run)
+    sep  = _compute_quark_sep_score(df_run)
+
+    c_ferm, c_sep = st.columns(2)
+    for col, label, result in [
+        (c_ferm, "Fermentation Health",   ferm),
+        (c_sep,  "Separation Stability",  sep),
+    ]:
+        with col:
+            with st.container(border=True):
+                st.markdown(f"**{label}**")
+                if result is None:
+                    st.caption("Model unavailable.")
+                else:
+                    score, _ = result
+                    status, badge = _score_status(score)
+                    st.metric("Score",  f"{score:.2f}")
+                    st.metric("Status", status)
+                    _STATUS_FN[status](badge)
+                    st.caption(
+                        f"Watch ≥ {_ML_WATCH_THRESH:.2f}  ·  High ≥ {_ML_HIGH_THRESH:.2f}"
+                    )
+
+    st.caption(
+        "Fermentation Health indicates upstream deviation during acidification.  "
+        "Separation Stability indicates downstream behaviour during centrifugation.  "
+        "Neither is a root-cause diagnosis — observational signals only."
+    )
+
+
+def _render_pudding_ml_card(
+    df_run:        pd.DataFrame,
+    product:       str,
+    selected_step: str,
+) -> None:
     result = _compute_ml_run_score(df_run, product)
     if result is None:
         st.caption("ML model not available for this product.")
         return
-
     run_score, run_threshold = result
-
-    if run_score < _ML_WATCH_THRESH:
-        status    = "Normal"
-        flag_text = "✅ Normal"
-        show_flag = st.success
-    elif run_score < _ML_HIGH_THRESH:
-        status    = "Watch"
-        flag_text = "⚠️ Watch"
-        show_flag = st.warning
-    else:
-        status    = "High"
-        flag_text = "🚨 High Risk"
-        show_flag = st.error
+    status, badge = _score_status(run_score)
 
     with st.container(border=True):
         c1, c2 = st.columns(2)
         c1.metric("Anomaly score", f"{run_score:.2f}")
         c2.metric("Status",        status)
-        show_flag(flag_text)
+        _STATUS_FN[status](badge)
         st.caption(
             f"Threshold (Watch): {_ML_WATCH_THRESH:.2f}  ·  "
             f"Threshold (High Risk): {_ML_HIGH_THRESH:.2f}  ·  "
             f"Training alert level (95th-pct NORMAL): {run_threshold:.4f}  ·  "
             f"Level 1 indicative signal — not a definitive alarm"
         )
-
-        # Step-level score: mean row-level anomaly score for the zoomed step
         if selected_step != "full_run" and "step" in df_run.columns:
             row_scores = _compute_ml_row_scores(df_run, product)
             if row_scores is not None:
-                step_mask = df_run["step"].values == selected_step
-                if step_mask.any():
-                    step_score = float(row_scores[step_mask].mean())
-                    step_label = selected_step.replace("_", " ").capitalize()
+                mask = df_run["step"].values == selected_step
+                if mask.any():
                     st.caption(
-                        f"Selected step score ({step_label}): {step_score:.2f}"
-                        f"  (mean row-level score)"
+                        f"Step score ({selected_step.replace('_', ' ').capitalize()}): "
+                        f"{float(row_scores[mask].mean()):.2f}  (mean row-level)"
                     )
 
 
-def _render_score_trend_chart(
-    df_run:        pd.DataFrame,
-    product:       str,
-    run_evts:      pd.DataFrame,
-    x_range:       tuple[float, float] | None,
-    selected_step: str,
-    run_id:        str,
-) -> None:
-    """Sliding-window anomaly score trend chart.
-
-    Shows mean row-level anomaly score in a _ML_TREND_WINDOW-minute rolling
-    window, stepping every _ML_TREND_STEP minutes.  The full run is always
-    scored; the display clips to x_range when a step is zoomed.
-
-    The computed trend is cached in session_state (keyed by run_id) so it
-    survives Streamlit reruns triggered by other widget interactions.
-    """
-    if not _SKLEARN_AVAILABLE or df_run.empty:
-        return
-
-    # Cache full-run trend — keyed by run_id only so zoom doesn't retrigger
-    cache_key = f"score_trend_{run_id}"
-    if cache_key not in st.session_state:
-        row_scores = _compute_ml_row_scores(df_run, product)
-        if row_scores is None:
-            return
-        t_all, s_all = _compute_score_trend(df_run["t_min"].values, row_scores)
-        st.session_state[cache_key] = (t_all, s_all)
-
-    t_all, s_all = st.session_state[cache_key]
-    if len(t_all) == 0:
-        return
-
-    # Clip to zoom window for display
-    if x_range is not None:
-        lo, hi  = x_range
-        vis_mask = (t_all >= lo) & (t_all <= hi)
-        t_vis, s_vis = t_all[vis_mask], s_all[vis_mask]
-    else:
-        t_vis, s_vis = t_all, s_all
-
-    if len(t_vis) == 0:
-        return
-
-    # First crossings within the visible window
+def _draw_trend_figure(
+    t_vis:       "np.ndarray",
+    s_vis:       "np.ndarray",
+    df_run:      "pd.DataFrame",
+    run_evts:    "pd.DataFrame",
+    x_range:     "tuple[float, float] | None",
+    product:     str,
+    title:       str,
+    trace_color: str,
+    fill_color:  str,
+):
+    """Shared chart builder for all score-trend variants."""
     first_watch = next((float(t) for t, s in zip(t_vis, s_vis) if s >= _ML_WATCH_THRESH), None)
     first_high  = next((float(t) for t, s in zip(t_vis, s_vis) if s >= _ML_HIGH_THRESH),  None)
 
-    # y-axis ceiling: 10% above the taller of the peak score and the High threshold,
-    # plus 0.15 absolute so threshold labels drawn at "top right" never touch the axis edge.
     y_max = max(float(s_vis.max()), _ML_HIGH_THRESH) * 1.1 + 0.15
 
-    # ── Figure ────────────────────────────────────────────────────────────────
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
         x=t_vis, y=s_vis,
         mode="lines",
-        line=dict(color="#FF6F00", width=2.0),
+        line=dict(color=trace_color, width=2.0),
         fill="tozeroy",
-        fillcolor="rgba(255,111,0,0.08)",
+        fillcolor=fill_color,
         hovertemplate="t = %{x:.1f} min<br>Window score = %{y:.3f}<extra></extra>",
         showlegend=False,
     ))
 
-    # Threshold reference lines — labels go into the right margin (r=100)
     fig.add_hline(
         y=_ML_WATCH_THRESH,
         line_dash="dash", line_color="#FF9800", line_width=1.2,
@@ -870,35 +924,23 @@ def _render_score_trend_chart(
         annotation_font_size=8, annotation_font_color="#E53935",
     )
 
-    # First-warning annotation — High takes precedence over Watch.
-    # Anchor in paper coordinates (yref="paper") so the text stays in the
-    # visible area regardless of the data scale; ax/ay are pixel offsets.
     first_warn = first_high if first_high is not None else first_watch
     if first_warn is not None:
         fig.add_vline(x=first_warn, line_dash="dot", line_color="#E53935", line_width=1.5)
         near = df_run[(df_run["t_min"] - first_warn).abs() < (_ML_TREND_STEP + 1.0)]
         step_lbl = near["step"].iloc[0].replace("_", " ") if not near.empty else ""
-        ann = f"first warning{' · ' + step_lbl if step_lbl else ''}"
+        ann = f"first warning{(' · ' + step_lbl) if step_lbl else ''}"
         fig.add_annotation(
-            x=first_warn,
-            xref="x",
-            y=0.88,
-            yref="paper",
+            x=first_warn, xref="x",
+            y=0.88, yref="paper",
             text=ann,
-            showarrow=True,
-            arrowhead=2,
-            arrowsize=1,
-            arrowwidth=1,
+            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1,
             arrowcolor="#E53935",
-            ax=12,
-            ay=-28,
-            axref="pixel",
-            ayref="pixel",
+            ax=12, ay=-28, axref="pixel", ayref="pixel",
             font=dict(size=9, color="#E53935"),
             bgcolor="rgba(255,255,255,0.82)",
         )
 
-    # Event markers — same filter and style as signal charts
     evt_filter   = _QUARK_EVENTS if product == "QUARK" else _PUDDING_EVENTS
     evts_visible = run_evts[run_evts["event_type"].isin(evt_filter)]
     if x_range is not None:
@@ -940,6 +982,136 @@ def _render_score_trend_chart(
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
 
+    return fig, first_warn, first_high
+
+
+def _render_quark_trend(
+    df_run:        "pd.DataFrame",
+    run_evts:      "pd.DataFrame",
+    x_range:       "tuple[float, float] | None",
+    selected_step: str,
+    run_id:        str,
+) -> None:
+    """Step-aware QUARK trend: fermentation vs separation dispatch."""
+    if selected_step == _QUARK_ML_SEP_STEP:
+        is_ferm = False
+    elif selected_step in _QUARK_ML_FERM_STEPS:
+        is_ferm = True
+    else:
+        is_ferm = True  # "all" or unknown -> fermentation health
+
+    if is_ferm:
+        cache_key   = f"ferm_trend_{run_id}"
+        chart_title = "Fermentation Health — Score Trend"
+        trace_color = "#1565C0"
+        fill_color  = "rgba(21,101,192,0.08)"
+        note        = (
+            "Fermentation Health score uses pH and temperature from fermentation steps only. "
+            "Elevated score indicates pH trajectory or temperature outside normal bounds."
+        )
+        if cache_key not in st.session_state:
+            result = _compute_quark_ferm_row_scores(df_run)
+            if result is None:
+                return
+            t_raw, s_raw = result
+            valid = ~np.isnan(s_raw)
+            if valid.sum() == 0:
+                return
+            t_all, s_all = _compute_score_trend(t_raw[valid], s_raw[valid])
+            st.session_state[cache_key] = (t_all, s_all)
+    else:
+        cache_key   = f"sep_trend_{run_id}"
+        chart_title = "Separation Stability — Score Trend"
+        trace_color = "#6A1B9A"
+        fill_color  = "rgba(106,27,154,0.08)"
+        note        = (
+            "Separation Stability score uses centrifuge speed and ΔP from steady-state "
+            "separation rows only (speed > 1 000 rpm). "
+            "Elevated score indicates pressure or speed instability during separation."
+        )
+        if cache_key not in st.session_state:
+            result = _compute_quark_sep_row_scores(df_run)
+            if result is None:
+                return
+            t_raw, s_raw = result
+            valid = ~np.isnan(s_raw)
+            if valid.sum() == 0:
+                return
+            t_all, s_all = _compute_score_trend(t_raw[valid], s_raw[valid])
+            st.session_state[cache_key] = (t_all, s_all)
+
+    t_all, s_all = st.session_state[cache_key]
+    if len(t_all) == 0:
+        return
+
+    if x_range is not None:
+        lo, hi   = x_range
+        vis_mask = (t_all >= lo) & (t_all <= hi)
+        t_vis, s_vis = t_all[vis_mask], s_all[vis_mask]
+    else:
+        t_vis, s_vis = t_all, s_all
+
+    if len(t_vis) == 0:
+        st.caption(f"No {chart_title.split('—')[0].strip()} data in the selected zoom window.")
+        return
+
+    fig, first_warn, first_high = _draw_trend_figure(
+        t_vis, s_vis, df_run, run_evts, x_range, "QUARK",
+        chart_title, trace_color, fill_color,
+    )
+
+    st.markdown(f"**{chart_title}**")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    if first_warn is not None:
+        cross_type = "High Risk" if first_high is not None else "Watch"
+        st.caption(
+            f"Indicative early warning: score crosses {cross_type} threshold around "
+            f"t = {first_warn:.0f} min.  Observational signal only — not a definitive alarm."
+        )
+    else:
+        st.caption(
+            "Score remains below Watch threshold in this window.  "
+            "Indicative signal only — not a definitive alarm."
+        )
+    st.caption(note)
+
+
+def _render_pudding_trend(
+    df_run:   "pd.DataFrame",
+    product:  str,
+    run_evts: "pd.DataFrame",
+    x_range:  "tuple[float, float] | None",
+    run_id:   str,
+) -> None:
+    """PUDDING trend chart — unchanged single-model behaviour."""
+    cache_key = f"score_trend_{run_id}"
+    if cache_key not in st.session_state:
+        row_scores = _compute_ml_row_scores(df_run, product)
+        if row_scores is None:
+            return
+        t_all, s_all = _compute_score_trend(df_run["t_min"].values, row_scores)
+        st.session_state[cache_key] = (t_all, s_all)
+
+    t_all, s_all = st.session_state[cache_key]
+    if len(t_all) == 0:
+        return
+
+    if x_range is not None:
+        lo, hi   = x_range
+        vis_mask = (t_all >= lo) & (t_all <= hi)
+        t_vis, s_vis = t_all[vis_mask], s_all[vis_mask]
+    else:
+        t_vis, s_vis = t_all, s_all
+
+    if len(t_vis) == 0:
+        return
+
+    fig, first_warn, first_high = _draw_trend_figure(
+        t_vis, s_vis, df_run, run_evts, x_range, product,
+        "Early Warning Score trend", "#FF6F00", "rgba(255,111,0,0.08)",
+    )
+
     st.markdown("**Early Warning Score trend**")
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
@@ -947,24 +1119,31 @@ def _render_score_trend_chart(
         cross_type = "High Risk" if first_high is not None else "Watch"
         st.caption(
             f"Indicative early warning: score crosses {cross_type} threshold around "
-            f"t = {first_warn:.0f} min.  "
-            f"Observational signal only — not a definitive alarm."
+            f"t = {first_warn:.0f} min.  Observational signal only — not a definitive alarm."
         )
     else:
         st.caption(
-            f"Score remains below Watch threshold in this window.  "
-            f"Indicative signal only — not a definitive alarm."
+            "Score remains below Watch threshold in this window.  "
+            "Indicative signal only — not a definitive alarm."
         )
+
+
+def _render_score_trend_chart(
+    df_run:        "pd.DataFrame",
+    product:       str,
+    run_evts:      "pd.DataFrame",
+    x_range:       "tuple[float, float] | None",
+    selected_step: str,
+    run_id:        str,
+) -> None:
+    """Dispatch to product-specific trend chart renderer."""
+    if not _SKLEARN_AVAILABLE or df_run.empty:
+        return
 
     if product == "QUARK":
-        st.caption(
-            "QUARK note: separation-step signals (centrifuge speed, ΔP) activate from zero "
-            "at the fermentation→separation transition, which consistently elevates the "
-            "row-level score for all runs — including normal ones.  "
-            "Use the trend shape and timing to compare runs; "
-            "absolute threshold crossings are unreliable for QUARK in this view."
-        )
-
+        _render_quark_trend(df_run, run_evts, x_range, selected_step, run_id)
+    else:
+        _render_pudding_trend(df_run, product, run_evts, x_range, run_id)
 
 # =============================================================================
 # SIMILAR RUNS  (cosine similarity on product-aware run feature vectors)
@@ -1178,7 +1357,10 @@ def render_sidebar(
 
 def _clear_run_widgets(run_id: str) -> None:
     """Remove per-run session state so the destination run starts fresh."""
-    for key in (f"step_zoom_{run_id}", f"baseline_{run_id}", f"score_trend_{run_id}"):
+    for key in (
+        f"step_zoom_{run_id}", f"baseline_{run_id}",
+        f"score_trend_{run_id}", f"ferm_trend_{run_id}", f"sep_trend_{run_id}",
+    ):
         st.session_state.pop(key, None)
 
 
