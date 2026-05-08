@@ -76,14 +76,88 @@ _PUDDING_SIGNALS: list[tuple[str, str, str, str]] = [
     ("flow_rate_lpm",         "Flow rate",   "L/min", "#4CAF50"),
 ]
 
+# Event types to show per product (others are filtered out to reduce clutter)
+_QUARK_EVENTS: frozenset[str] = frozenset({
+    "inoculation", "rennet_addition", "gel_break_start",
+    "separation_start", "standardization_start", "filling_start",
+})
+_PUDDING_EVENTS: frozenset[str] = frozenset({
+    "heating_start", "holding_start", "cooling_start",
+    "filling_start", "CIP", "maintenance",
+})
+
+# Short display labels for annotation text on the chart
+_EVENT_SHORT: dict[str, str] = {
+    "inoculation":           "Inoc.",
+    "rennet_addition":       "Rennet",
+    "gel_break_start":       "Gel brk",
+    "separation_start":      "Sep.",
+    "standardization_start": "Std.",
+    "filling_start":         "Fill",
+    "heating_start":         "Heat",
+    "holding_start":         "Hold",
+    "cooling_start":         "Cool",
+    "CIP":                   "CIP",
+    "maintenance":           "Maint.",
+}
+
+
+def _add_event_markers(
+    fig:    go.Figure,
+    evts:   pd.DataFrame,
+    col:    str,
+    df_run: pd.DataFrame,
+) -> None:
+    """Overlay one vertical marker per event on an existing figure.
+
+    Each marker is a dotted grey vline with a short annotation label and an
+    invisible scatter point at the top of the signal range that carries a
+    hover tooltip with the full event_type name and t_min.
+    """
+    if evts.empty:
+        return
+
+    # Hover target sits at the 97th-percentile of the signal to avoid being
+    # pushed off-chart by SENSOR_FAULT spikes while staying near the top.
+    valid = df_run[col].dropna()
+    y_top = float(valid.quantile(0.97)) if not valid.empty else 1.0
+
+    for _, row in evts.sort_values("t_min").iterrows():
+        t     = float(row["t_min"])
+        etype = str(row["event_type"])
+        short = _EVENT_SHORT.get(etype, etype[:7])
+
+        fig.add_vline(
+            x=t,
+            line_dash="dot",
+            line_color="#888888",
+            line_width=1.0,
+            annotation_text=short,
+            annotation_position="top right",
+            annotation_font_size=8,
+            annotation_font_color="#555555",
+        )
+        # Invisible marker — sole purpose is a richer hover tooltip
+        fig.add_trace(go.Scatter(
+            x=[t],
+            y=[y_top],
+            mode="markers",
+            marker=dict(size=7, symbol="triangle-down", color="#888888", opacity=0.6),
+            hovertemplate=(
+                f"<b>{etype}</b><br>t = {t:.1f} min<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
 
 def _make_signal_chart(
-    df_run: pd.DataFrame,
-    col:    str,
-    label:  str,
-    unit:   str,
-    color:  str,
+    df_run:     pd.DataFrame,
+    col:        str,
+    label:      str,
+    unit:       str,
+    color:      str,
     show_xaxis: bool = False,
+    evts:       pd.DataFrame | None = None,
 ) -> go.Figure:
     """Return a single compact Plotly line chart for one sensor signal."""
     fig = go.Figure()
@@ -115,10 +189,16 @@ def _make_signal_chart(
         plot_bgcolor="white",
         paper_bgcolor="white",
     )
+    if evts is not None and not evts.empty:
+        _add_event_markers(fig, evts, col, df_run)
     return fig
 
 
-def render_signal_charts(df_run: pd.DataFrame, product: str) -> None:
+def render_signal_charts(
+    df_run:   pd.DataFrame,
+    product:  str,
+    run_evts: pd.DataFrame,
+) -> None:
     """Render one Plotly line chart per signal, stacked vertically."""
     signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
 
@@ -134,9 +214,16 @@ def render_signal_charts(df_run: pd.DataFrame, product: str) -> None:
         st.info("No signal data available for this run.")
         return
 
+    evt_filter  = _QUARK_EVENTS if product == "QUARK" else _PUDDING_EVENTS
+    evts_to_show = run_evts[run_evts["event_type"].isin(evt_filter)]
+
     for i, (col, label, unit, color) in enumerate(renderable):
         is_last = (i == len(renderable) - 1)
-        fig = _make_signal_chart(df_run, col, label, unit, color, show_xaxis=is_last)
+        fig = _make_signal_chart(
+            df_run, col, label, unit, color,
+            show_xaxis=is_last,
+            evts=evts_to_show,
+        )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
@@ -263,8 +350,9 @@ def render_main(
     lab_row = lab[lab["run_id"] == run_id]
     lab_row = lab_row.iloc[0] if not lab_row.empty else None
 
-    story  = _find_story(demo_cases, run_id)  # None in explore mode
-    run_ts = ts[ts["run_id"] == run_id]       # filter once; shared by both render calls
+    story    = _find_story(demo_cases, run_id)       # None in explore mode
+    run_ts   = ts[ts["run_id"] == run_id]            # filter once; shared by chart renders
+    run_evts = events[events["run_id"] == run_id]    # events for this run
 
     # Build two-column layout: main content | right panel
     col_main, col_right = st.columns([2, 1], gap="large")
@@ -272,7 +360,7 @@ def render_main(
     with col_main:
         _render_run_header(run_row, story)
         _render_timeline_placeholder(run_ts)
-        render_signal_charts(run_ts, run_row["product"])
+        render_signal_charts(run_ts, run_row["product"], run_evts)
 
     with col_right:
         _render_right_panel(mode, run_row, lab_row, story)
