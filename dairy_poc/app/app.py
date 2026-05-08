@@ -789,17 +789,143 @@ def _compute_quark_sep_row_scores(
 
 # ── ML score panel ────────────────────────────────────────────────────────────
 
-def _render_ml_score_panel(
-    df_run:        pd.DataFrame,
+def _ml_why_bullets(
+    df_run:        "pd.DataFrame",
+    df_baseline:   "pd.DataFrame",
     product:       str,
-    x_range:       tuple[float, float] | None,
+    selected_step: str,
+) -> list:
+    """Top-2 descriptive bullet strings comparing run vs baseline in the active window.
+
+    Returns an empty list when data is insufficient or differences are negligible.
+    Avoids causal language; describes pattern differences only.
+    """
+    if df_run.empty or df_baseline.empty or "step" not in df_run.columns:
+        return []
+
+    findings = []  # (z_score, sentence)
+
+    def _analyse(run_rows, bas_rows, sig_col, sig_label, step_lbl):
+        if sig_col not in run_rows.columns:
+            return
+        sv = run_rows[sig_col].dropna()
+        bv = bas_rows[sig_col].dropna() if not bas_rows.empty else pd.Series([], dtype=float)
+        if len(sv) < 3 or len(bv) < 3:
+            return
+
+        sv_arr = sv.values.astype(float)
+        bv_arr = bv.values.astype(float)
+        st_t = run_rows.loc[sv.index, "t_min"].values.astype(float)
+        bt_t = bas_rows.loc[bv.index, "t_min"].values.astype(float)
+
+        mean_diff  = float(sv_arr.mean()) - float(bv_arr.mean())
+        std_run    = float(sv_arr.std())
+        std_bas    = float(bv_arr.std()) if len(bv_arr) > 1 else 0.0
+        std_diff   = std_run - std_bas
+        s_slope    = float(np.polyfit(st_t, sv_arr, 1)[0]) if len(st_t) > 1 else 0.0
+        b_slope    = float(np.polyfit(bt_t, bv_arr, 1)[0]) if len(bt_t) > 1 else 0.0
+        slope_diff = s_slope - b_slope
+
+        denom     = _norm_denom(bt_t, bv_arr)
+        step_dur  = float(st_t.max() - st_t.min()) if len(st_t) > 1 else 1.0
+        z_mean    = abs(mean_diff) / denom
+        z_drift   = abs(slope_diff) * step_dur / denom
+        z_var     = abs(std_diff) / max(std_bas, denom * 0.1, 0.001) if std_bas > 0 else 0.0
+        dominant  = max(z_mean, z_drift, z_var)
+        if dominant < 0.4:
+            return
+
+        lbl = step_lbl.replace("_", " ")
+        if z_mean >= z_drift and z_mean >= z_var:
+            dr = "higher" if mean_diff > 0 else "lower"
+            if sig_col == "pH":
+                sentence = f"pH level {dr} than reference during {lbl}"
+            elif sig_col == "temperature_C":
+                sentence = f"temperature {dr} than reference during {lbl}"
+            elif sig_col == "separation_deltaP":
+                sentence = f"separation ΔP {dr} than reference during {lbl}"
+            elif sig_col == "separator_speed_rpm":
+                sentence = f"centrifuge speed {dr} than reference during {lbl}"
+            elif sig_col == "pressure_bar":
+                sentence = f"pressure {dr} than reference during {lbl}"
+            elif sig_col == "deltaT_heat_exchanger":
+                sentence = f"heat exchanger ΔT {dr} than reference during {lbl}"
+            else:
+                sentence = f"{sig_label} level {dr} than reference during {lbl}"
+        elif z_drift >= z_var:
+            if sig_col == "pH":
+                dr = "faster" if slope_diff < 0 else "slower"
+                sentence = f"pH acidification {dr} than reference during {lbl}"
+            elif sig_col == "temperature_C":
+                dr = "steeper" if slope_diff > 0 else "flatter"
+                sentence = f"temperature slope {dr} than reference during {lbl}"
+            elif sig_col == "separation_deltaP":
+                dr = "increasing" if slope_diff > 0 else "decreasing"
+                sentence = f"separation ΔP trending {dr} vs reference during {lbl}"
+            elif sig_col == "flow_rate_lpm":
+                dr = "declining" if slope_diff < 0 else "rising"
+                sentence = f"flow rate {dr} relative to reference during {lbl}"
+            else:
+                dr = "steeper" if slope_diff > 0 else "flatter"
+                sentence = f"{sig_label} slope {dr} than reference during {lbl}"
+        else:
+            dr = "higher" if std_diff > 0 else "lower"
+            if sig_col == "separation_deltaP":
+                sentence = f"separation ΔP variability {dr} than reference during {lbl}"
+            elif sig_col == "pressure_bar":
+                sentence = f"pressure variability {dr} than reference during {lbl}"
+            else:
+                sentence = f"{sig_label} variability {dr} than reference during {lbl}"
+
+        findings.append((dominant, sentence))
+
+    def _run_scope(step_filter, sig_cols):
+        if step_filter is None:
+            rr, br = df_run, df_baseline
+            slbl = "the run"
+        elif isinstance(step_filter, (set, frozenset)):
+            rr = df_run[df_run["step"].isin(step_filter)]
+            br = df_baseline[df_baseline["step"].isin(step_filter)]
+            slbl = "fermentation" if step_filter & _QUARK_ML_FERM_STEPS else "the selected window"
+        else:
+            rr = df_run[df_run["step"] == step_filter]
+            br = df_baseline[df_baseline["step"] == step_filter]
+            slbl = step_filter
+        all_sigs = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+        for col, label, _, _ in all_sigs:
+            if col in sig_cols:
+                _analyse(rr, br, col, label, slbl)
+
+    if product == "QUARK":
+        ferm_sigs = {"pH", "temperature_C"}
+        sep_sigs  = {"separation_deltaP", "separator_speed_rpm"}
+        if selected_step in _QUARK_ML_FERM_STEPS:
+            _run_scope(selected_step, ferm_sigs)
+        elif selected_step == _QUARK_ML_SEP_STEP:
+            _run_scope(_QUARK_ML_SEP_STEP, sep_sigs)
+        else:  # full_run or unknown -> both contexts
+            _run_scope(_QUARK_ML_FERM_STEPS, ferm_sigs)
+            _run_scope(_QUARK_ML_SEP_STEP,   sep_sigs)
+    else:
+        step = selected_step if selected_step not in ("full_run", None) else None
+        pudding_sigs = {s[0] for s in _PUDDING_SIGNALS}
+        _run_scope(step, pudding_sigs)
+
+    findings.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in findings[:2]]
+
+
+def _render_ml_score_panel(
+    df_run:        "pd.DataFrame",
+    product:       str,
+    x_range:       "tuple[float, float] | None",
     selected_step: str,
     run_id:        str,
 ) -> None:
     """Always-visible ML Early Warning panel, product-aware.
 
-    QUARK: two side-by-side metric cards — Fermentation Health + Separation Stability.
-    PUDDING: single metric card (unchanged).
+    QUARK: two side-by-side metric cards + ferm/sep explainers.
+    PUDDING: single metric card + process-specific explainer.
     """
     st.subheader("ML Early Warning")
 
@@ -809,13 +935,127 @@ def _render_ml_score_panel(
     if df_run.empty:
         return
 
+    # ── Metric cards ──────────────────────────────────────────────────────────
     if product == "QUARK":
         _render_quark_ml_cards(df_run)
+        score_elevated = _quark_score_elevated(df_run)
     else:
         _render_pudding_ml_card(df_run, product, selected_step)
+        score_elevated = _pudding_score_elevated(df_run, product)
+
+    # ── Explanation expanders ─────────────────────────────────────────────────
+    _render_ml_explanation_expanders(product)
+
+    # ── Why it triggered ─────────────────────────────────────────────────────
+    # Always attempts to load a NORMAL baseline for this run (uses cached loaders).
+    try:
+        all_runs = load_runs()
+        all_ts   = load_timeseries()
+        run_meta = all_runs[all_runs["run_id"] == run_id]
+        scale    = str(run_meta["scale"].iloc[0]) if not run_meta.empty else "PRODUCTION"
+        b_rid    = _find_baseline_run_id(all_runs, product, scale)
+        df_baseline = all_ts[all_ts["run_id"] == b_rid].copy() if b_rid else None
+    except Exception:
+        df_baseline = None
+
+    if df_baseline is not None and score_elevated:
+        bullets = _ml_why_bullets(df_run, df_baseline, product, selected_step)
+        if bullets:
+            step_lbl = selected_step.replace("_", " ") if selected_step != "full_run" else "full run"
+            with st.container(border=True):
+                st.caption(
+                    f"⚠️ **Pattern differences vs normal reference"
+                    f" ({step_lbl})**"
+                )
+                for b in bullets:
+                    st.caption(f"• {b}")
+                st.caption(
+                    "_These observations describe signal patterns that differ from "
+                    "typical NORMAL runs. They are indicative of where to investigate "
+                    "— not a diagnosis or root-cause statement._"
+                )
 
 
-def _render_quark_ml_cards(df_run: pd.DataFrame) -> None:
+def _quark_score_elevated(df_run: "pd.DataFrame") -> bool:
+    """True when either QUARK sub-score is Watch or High."""
+    ferm = _compute_quark_ferm_score(df_run)
+    sep  = _compute_quark_sep_score(df_run)
+    for result in (ferm, sep):
+        if result is not None:
+            score, _ = result
+            if score >= _ML_WATCH_THRESH:
+                return True
+    return False
+
+
+def _pudding_score_elevated(df_run: "pd.DataFrame", product: str) -> bool:
+    """True when PUDDING run score is Watch or High."""
+    result = _compute_ml_run_score(df_run, product)
+    return result is not None and result[0] >= _ML_WATCH_THRESH
+
+
+def _render_ml_explanation_expanders(product: str) -> None:
+    """Two collapsible expanders: interpretation guide + score calculation."""
+    is_quark = product == "QUARK"
+
+    with st.expander("What does this early warning mean?"):
+        st.caption(
+            "✅ **Normal** — signal patterns are consistent with stable "
+            "historical runs for this product and step. No action needed."
+        )
+        st.caption(
+            "⚠️ **Watch** — a deviation pattern is emerging. "
+            "Review the highlighted step or window to see which signals are shifting."
+        )
+        st.caption(
+            "🚨 **High** — a strong deviation pattern is present. "
+            "Treat as a priority for process review; compare against reference runs."
+        )
+        st.caption(
+            "_These are indicative signals from a pattern-matching model — "
+            "not definitive process alarms. Always apply process and domain "
+            "knowledge before acting._"
+        )
+
+    calc_text_intro = (
+        "The score measures how different this run’s signal patterns are "
+        "from patterns seen in NORMAL runs (trained and calibrated on NORMAL data only)."
+    )
+    if is_quark:
+        score_detail = (
+            "**Fermentation Health** captures pH trajectory and temperature patterns "
+            "during inoculation and fermentation. "
+            "**Separation Stability** captures centrifuge speed and ΔP patterns "
+            "during the separation phase. "
+            "These are independent scores — separation stability reflects "
+            "downstream centrifugation behaviour, not fermentation outcomes."
+        )
+    else:
+        score_detail = (
+            "The score captures temperature, pressure, heat-exchanger ΔT, and "
+            "flow rate patterns across heating, holding, and downstream steps. "
+            "A high score during holding often reflects thermal uniformity or "
+            "fouling-related patterns."
+        )
+
+    with st.expander("How is the score calculated (simplified)?"):
+        st.caption(calc_text_intro)
+        st.caption(
+            "• Patterns detected: level shifts, drift (slope change), and "
+            "variability relative to typical NORMAL runs."
+        )
+        st.caption(
+            "• The model is trained and threshold-calibrated on NORMAL runs only — "
+            "anomalous patterns produce higher scores."
+        )
+        st.caption(
+            "• The trend chart uses a 30-min sliding window updated every 5 min, "
+            "showing how the score evolves through the run."
+        )
+        st.caption(score_detail)
+
+
+def _render_quark_ml_cards(df_run: "pd.DataFrame") -> None:
     ferm = _compute_quark_ferm_score(df_run)
     sep  = _compute_quark_sep_score(df_run)
 
@@ -847,7 +1087,7 @@ def _render_quark_ml_cards(df_run: pd.DataFrame) -> None:
 
 
 def _render_pudding_ml_card(
-    df_run:        pd.DataFrame,
+    df_run:        "pd.DataFrame",
     product:       str,
     selected_step: str,
 ) -> None:
@@ -878,7 +1118,6 @@ def _render_pudding_ml_card(
                         f"Step score ({selected_step.replace('_', ' ').capitalize()}): "
                         f"{float(row_scores[mask].mean()):.2f}  (mean row-level)"
                     )
-
 
 def _draw_trend_figure(
     t_vis:       "np.ndarray",
