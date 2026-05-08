@@ -366,6 +366,8 @@ _ML_WINDOW:        int   = 10    # rolling window for slope/std features (minute
 _ML_THRESHOLD_PCT: float = 95.0  # percentile of NORMAL scores used as alert level
 _ML_WATCH_THRESH:  float = 0.90  # run-level model score: Watch starts here (calibrated)
 _ML_HIGH_THRESH:   float = 1.00  # run-level model score: High = at/above 95th-pct NORMAL
+_ML_TREND_WINDOW:  int   = 30    # sliding window width in minutes for the score trend chart
+_ML_TREND_STEP:    int   = 5     # step between successive windows in minutes
 
 
 def _extract_run_summary(
@@ -622,6 +624,39 @@ def _render_ml_warning(
     )
 
 
+def _compute_score_trend(
+    t_arr:      np.ndarray,
+    row_scores: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sliding-window mean of normalised row-level scores.
+
+    For each window ending at time t (stepping by _ML_TREND_STEP minutes),
+    takes the mean of row_scores for all rows with t_min in [t-window, t].
+    Returns (t_ends, window_means).  Windows with < 3 rows are skipped.
+    Always computed on the full run; callers clip for display.
+    """
+    if len(t_arr) == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    t_start = float(t_arr.min())
+    t_end   = float(t_arr.max())
+    t_ends: list[float] = []
+    scores:  list[float] = []
+
+    tc = t_start + _ML_TREND_WINDOW
+    while True:
+        tc = min(tc, t_end)
+        mask = (t_arr >= tc - _ML_TREND_WINDOW) & (t_arr <= tc)
+        if mask.sum() >= 3:
+            t_ends.append(tc)
+            scores.append(float(row_scores[mask].mean()))
+        if tc >= t_end:
+            break
+        tc += _ML_TREND_STEP
+
+    return np.array(t_ends, dtype=float), np.array(scores, dtype=float)
+
+
 def _compute_ml_run_score(
     df_run:  pd.DataFrame,
     product: str,
@@ -737,6 +772,170 @@ def _render_ml_score_panel(
                     )
 
 
+def _render_score_trend_chart(
+    df_run:        pd.DataFrame,
+    product:       str,
+    run_evts:      pd.DataFrame,
+    x_range:       tuple[float, float] | None,
+    selected_step: str,
+    run_id:        str,
+) -> None:
+    """Sliding-window anomaly score trend chart.
+
+    Shows mean row-level anomaly score in a _ML_TREND_WINDOW-minute rolling
+    window, stepping every _ML_TREND_STEP minutes.  The full run is always
+    scored; the display clips to x_range when a step is zoomed.
+
+    The computed trend is cached in session_state (keyed by run_id) so it
+    survives Streamlit reruns triggered by other widget interactions.
+    """
+    if not _SKLEARN_AVAILABLE or df_run.empty:
+        return
+
+    # Cache full-run trend — keyed by run_id only so zoom doesn't retrigger
+    cache_key = f"score_trend_{run_id}"
+    if cache_key not in st.session_state:
+        row_scores = _compute_ml_row_scores(df_run, product)
+        if row_scores is None:
+            return
+        t_all, s_all = _compute_score_trend(df_run["t_min"].values, row_scores)
+        st.session_state[cache_key] = (t_all, s_all)
+
+    t_all, s_all = st.session_state[cache_key]
+    if len(t_all) == 0:
+        return
+
+    # Clip to zoom window for display
+    if x_range is not None:
+        lo, hi  = x_range
+        vis_mask = (t_all >= lo) & (t_all <= hi)
+        t_vis, s_vis = t_all[vis_mask], s_all[vis_mask]
+    else:
+        t_vis, s_vis = t_all, s_all
+
+    if len(t_vis) == 0:
+        return
+
+    # First crossings within the visible window
+    first_watch = next((float(t) for t, s in zip(t_vis, s_vis) if s >= _ML_WATCH_THRESH), None)
+    first_high  = next((float(t) for t, s in zip(t_vis, s_vis) if s >= _ML_HIGH_THRESH),  None)
+
+    y_max = max(float(s_vis.max()) * 1.18, _ML_HIGH_THRESH * 1.2)
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=t_vis, y=s_vis,
+        mode="lines",
+        line=dict(color="#FF6F00", width=2.0),
+        fill="tozeroy",
+        fillcolor="rgba(255,111,0,0.08)",
+        hovertemplate="t = %{x:.1f} min<br>Window score = %{y:.3f}<extra></extra>",
+        showlegend=False,
+    ))
+
+    # Threshold reference lines
+    fig.add_hline(
+        y=_ML_WATCH_THRESH,
+        line_dash="dash", line_color="#FF9800", line_width=1.2,
+        annotation_text=f"Watch ({_ML_WATCH_THRESH:.2f})",
+        annotation_position="top right",
+        annotation_font_size=8, annotation_font_color="#FF9800",
+    )
+    fig.add_hline(
+        y=_ML_HIGH_THRESH,
+        line_dash="dash", line_color="#E53935", line_width=1.5,
+        annotation_text=f"High ({_ML_HIGH_THRESH:.2f})",
+        annotation_position="top right",
+        annotation_font_size=8, annotation_font_color="#E53935",
+    )
+
+    # First-warning annotation — High takes precedence over Watch
+    first_warn = first_high if first_high is not None else first_watch
+    if first_warn is not None:
+        fig.add_vline(x=first_warn, line_dash="dot", line_color="#E53935", line_width=1.5)
+        near = df_run[(df_run["t_min"] - first_warn).abs() < (_ML_TREND_STEP + 1.0)]
+        step_lbl = near["step"].iloc[0].replace("_", " ") if not near.empty else ""
+        ann = f"first warning{' · ' + step_lbl if step_lbl else ''}"
+        fig.add_annotation(
+            x=first_warn, y=y_max * 0.87,
+            text=ann,
+            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1,
+            arrowcolor="#E53935",
+            font=dict(size=9, color="#E53935"),
+            xanchor="left",
+            bgcolor="rgba(255,255,255,0.82)",
+        )
+
+    # Event markers — same filter and style as signal charts
+    evt_filter   = _QUARK_EVENTS if product == "QUARK" else _PUDDING_EVENTS
+    evts_visible = run_evts[run_evts["event_type"].isin(evt_filter)]
+    if x_range is not None:
+        evts_visible = evts_visible[
+            (evts_visible["t_min"] >= x_range[0]) & (evts_visible["t_min"] <= x_range[1])
+        ]
+    y_evt = float(np.percentile(s_vis, 90)) if len(s_vis) >= 2 else _ML_WATCH_THRESH
+    for _, erow in evts_visible.iterrows():
+        t_e   = float(erow["t_min"])
+        etype = str(erow["event_type"])
+        short = _EVENT_SHORT.get(etype, etype[:7])
+        fig.add_vline(
+            x=t_e, line_dash="dot", line_color="#888888", line_width=1.0,
+            annotation_text=short,
+            annotation_position="top right",
+            annotation_font_size=8, annotation_font_color="#555555",
+        )
+        fig.add_trace(go.Scatter(
+            x=[t_e], y=[y_evt],
+            mode="markers",
+            marker=dict(size=7, symbol="triangle-down", color="#888888", opacity=0.6),
+            hovertemplate=f"<b>{etype}</b><br>t = {t_e:.1f} min<extra></extra>",
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        height=165,
+        margin=dict(l=8, r=8, t=4, b=36),
+        xaxis=dict(title="t (min)", showgrid=True, gridcolor="#ebebeb", zeroline=False),
+        yaxis=dict(
+            title=f"Score ({_ML_TREND_WINDOW}-min window)",
+            showgrid=True, gridcolor="#ebebeb", zeroline=False,
+            range=[0, y_max],
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+    )
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
+
+    st.markdown("**Early Warning Score trend**")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    if first_warn is not None:
+        cross_type = "High Risk" if first_high is not None else "Watch"
+        st.caption(
+            f"Indicative early warning: score crosses {cross_type} threshold around "
+            f"t = {first_warn:.0f} min.  "
+            f"Observational signal only — not a definitive alarm."
+        )
+    else:
+        st.caption(
+            f"Score remains below Watch threshold in this window.  "
+            f"Indicative signal only — not a definitive alarm."
+        )
+
+    if product == "QUARK":
+        st.caption(
+            "QUARK note: separation-step signals (centrifuge speed, ΔP) activate from zero "
+            "at the fermentation→separation transition, which consistently elevates the "
+            "row-level score for all runs — including normal ones.  "
+            "Use the trend shape and timing to compare runs; "
+            "absolute threshold crossings are unreliable for QUARK in this view."
+        )
+
+
 # =============================================================================
 # SIDEBAR — mode toggle + selectors
 # =============================================================================
@@ -778,7 +977,7 @@ def render_sidebar(
 
 def _clear_run_widgets(run_id: str) -> None:
     """Remove per-run session state so the destination run starts fresh."""
-    for key in (f"step_zoom_{run_id}", f"baseline_{run_id}"):
+    for key in (f"step_zoom_{run_id}", f"baseline_{run_id}", f"score_trend_{run_id}"):
         st.session_state.pop(key, None)
 
 
@@ -947,6 +1146,7 @@ def render_main(
         _render_run_header(run_row, story)
         _render_process_timeline(run_ts, run_evts, selected_step)
         _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
+        _render_score_trend_chart(run_ts, run_row["product"], run_evts, x_range, selected_step, run_id)
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
