@@ -390,23 +390,72 @@ def render_sidebar(
     return ("guided" if guided else "explore"), run_id
 
 
+def _clear_run_widgets(run_id: str) -> None:
+    """Remove per-run session state so the destination run starts fresh."""
+    for key in (f"step_zoom_{run_id}", f"baseline_{run_id}"):
+        st.session_state.pop(key, None)
+
+
+def _on_guided_nav(stories: list, new_idx: int) -> None:
+    """Button callback: move to new_idx and reset the destination run's widgets."""
+    st.session_state["guided_idx"] = new_idx
+    _clear_run_widgets(stories[new_idx]["run_id"])
+
+
+def _on_guided_select(stories: list) -> None:
+    """Selectbox on_change callback: reset widgets for the newly selected run."""
+    _clear_run_widgets(stories[st.session_state["guided_idx"]]["run_id"])
+
+
 def _sidebar_guided(demo_cases: dict) -> str | None:
-    """Story-mode sidebar: one selectbox over curated runs."""
+    """Story-mode sidebar: selectbox + Prev / Next navigation buttons."""
     stories = demo_cases.get("stories", [])
     if not stories:
         st.sidebar.warning("No demo cases found in demo_cases.json.")
         return None
 
-    labels = [
-        f"{s['run_id']}  ·  {s['short_title']}"
-        for s in stories
-    ]
-    idx = st.sidebar.selectbox(
+    n = len(stories)
+
+    # Initialise index on first visit (or after a hot-reload)
+    if "guided_idx" not in st.session_state:
+        st.session_state["guided_idx"] = 0
+
+    labels = [f"{s['run_id']}  ·  {s['short_title']}" for s in stories]
+
+    # Selectbox — key="guided_idx" makes session_state the single source of truth
+    st.sidebar.selectbox(
         "Select story",
-        options=range(len(labels)),
+        options=range(n),
         format_func=lambda i: labels[i],
         label_visibility="collapsed",
+        key="guided_idx",
+        on_change=_on_guided_select,
+        kwargs={"stories": stories},
     )
+
+    idx = st.session_state["guided_idx"]
+
+    # Prev / Next buttons
+    col_prev, col_next = st.sidebar.columns(2)
+    col_prev.button(
+        "◀  Prev",
+        disabled=(idx == 0),
+        on_click=_on_guided_nav,
+        kwargs={"stories": stories, "new_idx": idx - 1},
+        use_container_width=True,
+        key="guided_prev",
+    )
+    col_next.button(
+        "Next  ▶",
+        disabled=(idx == n - 1),
+        on_click=_on_guided_nav,
+        kwargs={"stories": stories, "new_idx": idx + 1},
+        use_container_width=True,
+        key="guided_next",
+    )
+
+    st.sidebar.caption(f"Story {idx + 1} of {n}")
+
     return stories[idx]["run_id"]
 
 
