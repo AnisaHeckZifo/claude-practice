@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -54,6 +55,89 @@ def load_events() -> pd.DataFrame:
 def load_demo_cases() -> dict:
     with open(_PROC / "demo_cases.json", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+# =============================================================================
+# SIGNAL CHARTS
+# =============================================================================
+
+# (col_name, y-axis label, unit, line colour)
+_QUARK_SIGNALS: list[tuple[str, str, str, str]] = [
+    ("pH",                  "pH",              "–",    "#2196F3"),
+    ("temperature_C",       "Temperature",     "°C",   "#FF5722"),
+    ("separator_speed_rpm", "Centrifuge speed","rpm",  "#9C27B0"),
+    ("separation_deltaP",   "Sep. ΔP",         "bar",  "#FF9800"),
+]
+
+_PUDDING_SIGNALS: list[tuple[str, str, str, str]] = [
+    ("temperature_C",         "Temperature", "°C",    "#FF5722"),
+    ("pressure_bar",          "Pressure",    "bar",   "#607D8B"),
+    ("deltaT_heat_exchanger", "HX ΔT",       "°C",    "#F44336"),
+    ("flow_rate_lpm",         "Flow rate",   "L/min", "#4CAF50"),
+]
+
+
+def _make_signal_chart(
+    df_run: pd.DataFrame,
+    col:    str,
+    label:  str,
+    unit:   str,
+    color:  str,
+    show_xaxis: bool = False,
+) -> go.Figure:
+    """Return a single compact Plotly line chart for one sensor signal."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df_run["t_min"],
+        y=df_run[col],
+        mode="lines",
+        line=dict(color=color, width=1.8),
+        name=label,
+        connectgaps=False,      # NaN → visible gap in the line
+    ))
+    fig.update_layout(
+        height=185,
+        margin=dict(l=8, r=8, t=6, b=36 if show_xaxis else 6),
+        xaxis=dict(
+            title="t (min)" if show_xaxis else None,
+            showticklabels=show_xaxis,
+            showgrid=True,
+            gridcolor="#ebebeb",
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title=f"{label} ({unit})",
+            showgrid=True,
+            gridcolor="#ebebeb",
+            zeroline=False,
+        ),
+        showlegend=False,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    return fig
+
+
+def render_signal_charts(df_run: pd.DataFrame, product: str) -> None:
+    """Render one Plotly line chart per signal, stacked vertically."""
+    signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+
+    # Keep only signals that exist in the DataFrame and have at least one value
+    renderable = [
+        sig for sig in signals
+        if sig[0] in df_run.columns and not df_run[sig[0]].isna().all()
+    ]
+
+    st.subheader("Sensor charts")
+
+    if not renderable:
+        st.info("No signal data available for this run.")
+        return
+
+    for i, (col, label, unit, color) in enumerate(renderable):
+        is_last = (i == len(renderable) - 1)
+        fig = _make_signal_chart(df_run, col, label, unit, color, show_xaxis=is_last)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 # =============================================================================
@@ -179,15 +263,16 @@ def render_main(
     lab_row = lab[lab["run_id"] == run_id]
     lab_row = lab_row.iloc[0] if not lab_row.empty else None
 
-    story = _find_story(demo_cases, run_id)  # None in explore mode
+    story  = _find_story(demo_cases, run_id)  # None in explore mode
+    run_ts = ts[ts["run_id"] == run_id]       # filter once; shared by both render calls
 
     # Build two-column layout: main content | right panel
     col_main, col_right = st.columns([2, 1], gap="large")
 
     with col_main:
         _render_run_header(run_row, story)
-        _render_timeline_placeholder(run_id, ts)
-        _render_charts_placeholder(run_id, ts, run_row)
+        _render_timeline_placeholder(run_ts)
+        render_signal_charts(run_ts, run_row["product"])
 
     with col_right:
         _render_right_panel(mode, run_row, lab_row, story)
@@ -217,8 +302,7 @@ def _render_run_header(run_row: pd.Series, story: dict | None) -> None:
 
 # ── Timeline placeholder ──────────────────────────────────────────────────────
 
-def _render_timeline_placeholder(run_id: str, ts: pd.DataFrame) -> None:
-    run_ts   = ts[ts["run_id"] == run_id]
+def _render_timeline_placeholder(run_ts: pd.DataFrame) -> None:
     steps    = run_ts["step"].unique().tolist() if not run_ts.empty else []
     n_rows   = len(run_ts)
     dur_min  = float(run_ts["t_min"].max()) if not run_ts.empty else 0.0
@@ -233,8 +317,6 @@ def _render_timeline_placeholder(run_id: str, ts: pd.DataFrame) -> None:
             "Chart will go here: step-shaded timeline with sensor overlays "
             "(temperature, pH, separator_speed_rpm, fouling_index …)."
         )
-        # Debug wire-check
-        st.write("**Selected run_id (wire check):**", run_id)
         if not run_ts.empty:
             st.dataframe(
                 run_ts[["t_min", "step", "temperature_C", "pH", "anomaly_flag"]]
@@ -242,36 +324,6 @@ def _render_timeline_placeholder(run_id: str, ts: pd.DataFrame) -> None:
                 use_container_width=True,
                 hide_index=True,
             )
-
-
-# ── Charts placeholder ────────────────────────────────────────────────────────
-
-def _render_charts_placeholder(
-    run_id:  str,
-    ts:      pd.DataFrame,
-    run_row: pd.Series,
-) -> None:
-    product  = run_row["product"]
-    scenario = run_row["scenario"]
-
-    # Decide which sensor panels are relevant so the placeholder is informative
-    panels: list[str] = ["temperature_C", "pressure_bar + flow_rate_lpm"]
-    if product == "QUARK":
-        panels += ["pH (full run)", "separator_speed_rpm + separation_deltaP"]
-    else:
-        panels += ["fouling_index + deltaT_heat_exchanger", "viscosity_proxy"]
-
-    st.subheader("Sensor charts")
-    with st.container(border=True):
-        st.caption(f"Placeholder — {scenario} · {product.replace('HIGH_PROTEIN_PUDDING','Pudding')}")
-        st.info(
-            "Charts will go here. Planned panels:\n"
-            + "\n".join(f"  • {p}" for p in panels)
-        )
-        run_ts = ts[ts["run_id"] == run_id]
-        if not run_ts.empty:
-            anom_count = int(run_ts["anomaly_flag"].sum())
-            st.write(f"anomaly_flag rows: **{anom_count}** of {len(run_ts):,}")
 
 
 # ── Right panel ───────────────────────────────────────────────────────────────
