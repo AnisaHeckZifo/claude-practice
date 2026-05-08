@@ -705,145 +705,324 @@ def _render_process_timeline(
 
 # ── Baseline divergence panel ────────────────────────────────────────────────
 
-def _compute_divergence_metrics(
+# Divergence is flagged when a metric exceeds 1.5× the baseline noise floor.
+_Z_THRESH: float = 1.5
+
+# Process-step categories used for product-aware narrative language.
+_QUARK_FERM_STEPS: frozenset[str] = frozenset({
+    "inoculation_mixing", "early_fermentation", "late_fermentation", "gel_break_mixing",
+})
+_QUARK_SEP_STEPS: frozenset[str] = frozenset({
+    "separation", "standardization_mix",
+})
+_PUDDING_THERMAL_STEPS: frozenset[str] = frozenset({
+    "mixing", "heating", "holding",
+})
+
+
+def _residual_std(t: np.ndarray, y: np.ndarray) -> float:
+    """Std of residuals after removing the linear trend within a step.
+
+    Detrending is critical for signals like pH that change monotonically
+    during fermentation: raw std would include trend variance and make real
+    run-vs-baseline differences look small relative to the noise level.
+    Falls back to raw std when fewer than 3 points are available.
+    """
+    if len(t) < 3:
+        return float(y.std()) if len(y) > 1 else 0.001
+    slope, intercept = np.polyfit(t, y, 1)
+    return max(float((y - (slope * t + intercept)).std()), 0.001)
+
+
+def _norm_denom(t: np.ndarray, y: np.ndarray) -> float:
+    """Normalisation denominator: detrended residual std, floored at 1% of |mean|."""
+    res_std  = _residual_std(t, y)
+    mean_abs = abs(float(y.mean()))
+    return max(res_std, 0.01 * mean_abs if mean_abs > 0 else 0.0, 0.001)
+
+
+def _analyze_step_divergence(
     df_run:      pd.DataFrame,
     df_baseline: pd.DataFrame,
     signals:     list[tuple[str, str, str, str]],
-    x_range:     tuple[float, float] | None,
 ) -> list[dict]:
-    """Return per-signal divergence metrics, sorted by score descending.
+    """Scan steps in chronological order and compute per-signal divergence.
 
-    Clips both DataFrames to x_range before computing.  Signals with fewer
-    than 2 non-null rows in either series are skipped.
+    Steps are matched by the 'step' column (names are standardised per product).
+    A step is flagged divergent when any signal exceeds _Z_THRESH after
+    normalising by the detrended baseline noise floor.
 
-    Each result dict contains:
-      col, label, unit, mean_diff, std_diff, slope_diff, max_abs_diff,
-      mean_norm, slope_norm, score.
+    Returns a list of step dicts:
+      {step, diverges, sigs: [{col, label, unit, mean_diff, slope_diff,
+                                z_mean, z_drift, diverges}, ...]}
     """
-    if x_range is not None:
-        lo, hi = x_range
-        sel = df_run[  (df_run["t_min"]   >= lo) & (df_run["t_min"]   <= hi)]
-        bas = df_baseline[(df_baseline["t_min"] >= lo) & (df_baseline["t_min"] <= hi)]
-    else:
-        sel = df_run
-        bas = df_baseline
-
-    rows: list[dict] = []
-    for col, label, unit, _ in signals:
-        if col not in sel.columns or col not in bas.columns:
-            continue
-
-        sv = sel[col].dropna()
-        bv = bas[col].dropna()
-        if len(sv) < 2 or len(bv) < 2:
-            continue
-
-        sv_arr = sv.values.astype(float)
-        bv_arr = bv.values.astype(float)
-        st_arr = sel.loc[sv.index, "t_min"].values.astype(float)
-        bt_arr = bas.loc[bv.index, "t_min"].values.astype(float)
-
-        mean_diff  = float(sv_arr.mean()) - float(bv_arr.mean())
-        std_diff   = float(sv_arr.std())  - float(bv_arr.std())
-        slope_diff = (float(np.polyfit(st_arr, sv_arr, 1)[0])
-                    - float(np.polyfit(bt_arr, bv_arr, 1)[0]))
-
-        # Point-wise |diff| on aligned t_min; fall back to |mean_diff| if no overlap
-        merged = (
-            sel[["t_min", col]].rename(columns={col: "s"})
-            .merge(bas[["t_min", col]].rename(columns={col: "b"}), on="t_min", how="inner")
-            .dropna()
-        )
-        max_abs_diff = (
-            float((merged["s"] - merged["b"]).abs().max())
-            if not merged.empty else abs(mean_diff)
-        )
-
-        rows.append({
-            "col": col, "label": label, "unit": unit,
-            "mean_diff": mean_diff, "std_diff": std_diff,
-            "slope_diff": slope_diff, "max_abs_diff": max_abs_diff,
-        })
-
-    if not rows:
+    if df_run.empty or "step" not in df_run.columns:
         return []
 
-    def _norm(vals: list[float]) -> list[float]:
-        arr = np.array(vals, dtype=float)
-        hi  = arr.max()
-        return (arr / hi).tolist() if hi > 0 else [0.0] * len(arr)
+    first_t      = df_run.groupby("step")["t_min"].min()
+    ordered_steps = first_t.sort_values().index.tolist()
 
-    mn  = _norm([abs(r["mean_diff"])  for r in rows])
-    sn  = _norm([abs(r["slope_diff"]) for r in rows])
-    mxn = _norm([r["max_abs_diff"]    for r in rows])
+    results: list[dict] = []
+    for step in ordered_steps:
+        sel = df_run[df_run["step"] == step]
+        bas = df_baseline[df_baseline["step"] == step]
 
-    for i, r in enumerate(rows):
-        r["mean_norm"]  = mn[i]
-        r["slope_norm"] = sn[i]
-        r["score"]      = 0.35 * mn[i] + 0.35 * sn[i] + 0.30 * mxn[i]
+        sig_results: list[dict] = []
+        step_diverges = False
 
-    rows.sort(key=lambda r: r["score"], reverse=True)
-    return rows
+        for col, label, unit, _ in signals:
+            if col not in sel.columns:
+                continue
+
+            sv = sel[col].dropna()
+            bv = bas[col].dropna() if not bas.empty else pd.Series([], dtype=float)
+            if len(sv) < 3 or len(bv) < 3:
+                continue
+
+            sv_arr = sv.values.astype(float)
+            bv_arr = bv.values.astype(float)
+            st_t   = sel.loc[sv.index, "t_min"].values.astype(float)
+            bt_t   = bas.loc[bv.index, "t_min"].values.astype(float)
+
+            mean_diff  = float(sv_arr.mean()) - float(bv_arr.mean())
+            std_diff   = float(sv_arr.std())  - float(bv_arr.std())
+            s_slope    = float(np.polyfit(st_t, sv_arr, 1)[0]) if len(st_t) > 1 else 0.0
+            b_slope    = float(np.polyfit(bt_t, bv_arr, 1)[0]) if len(bt_t) > 1 else 0.0
+            slope_diff = s_slope - b_slope
+
+            denom    = _norm_denom(bt_t, bv_arr)
+            step_dur = float(st_t.max() - st_t.min()) if len(st_t) > 1 else 1.0
+            z_mean   = abs(mean_diff)  / denom
+            z_drift  = abs(slope_diff) * step_dur / denom  # total slope-drift normalised
+
+            sig_div = z_mean > _Z_THRESH or z_drift > _Z_THRESH
+            if sig_div:
+                step_diverges = True
+
+            sig_results.append({
+                "col": col, "label": label, "unit": unit,
+                "mean_diff": mean_diff, "std_diff": std_diff, "slope_diff": slope_diff,
+                "z_mean": z_mean, "z_drift": z_drift, "diverges": sig_div,
+            })
+
+        results.append({"step": step, "diverges": step_diverges, "sigs": sig_results})
+
+    return results
+
+
+def _step_bullets(
+    step:       str,
+    product:    str,
+    sigs:       list[dict],
+    is_first:   bool,
+    first_step: str,
+) -> list[str]:
+    """Return 1–2 process-language bullet strings for a divergent step.
+
+    Separation and cooling signals are framed as observations consistent with
+    upstream differences, not as causes.  "caused by", "root cause", and
+    "primary driver" are never used.
+    """
+    diverging = sorted(
+        [s for s in sigs if s["diverges"]],
+        key=lambda s: s["z_mean"], reverse=True,
+    )
+    if not diverging:
+        return []
+
+    def d(v: float, pos: str = "above", neg: str = "below") -> str:
+        return pos if v > 0 else neg
+
+    def fmt(v: float, unit: str) -> str:
+        return f"{v:+.3g} {unit}".rstrip()
+
+    bullets: list[str] = []
+
+    if product == "QUARK":
+        ph   = next((s for s in diverging if s["col"] == "pH"), None)
+        temp = next((s for s in diverging if s["col"] == "temperature_C"), None)
+        spd  = next((s for s in diverging if s["col"] == "separator_speed_rpm"), None)
+        dp   = next((s for s in diverging if s["col"] == "separation_deltaP"), None)
+
+        if step in _QUARK_FERM_STEPS:
+            if ph:
+                dr = d(ph["mean_diff"], "higher", "lower")
+                slope_note = ""
+                if ph["z_drift"] > _Z_THRESH:
+                    slope_note = (
+                        ", with acidification proceeding faster than reference"
+                        if ph["slope_diff"] < 0
+                        else ", with acidification proceeding more slowly than reference"
+                    )
+                bullets.append(
+                    f"pH is {dr} than reference ({fmt(ph['mean_diff'], ph['unit'])})"
+                    f"{slope_note}, consistent with a difference in fermentation progression."
+                )
+            if temp and len(bullets) < 2:
+                dr = d(temp["mean_diff"], "higher", "lower")
+                bullets.append(
+                    f"Incubation temperature is {dr} than reference "
+                    f"({fmt(temp['mean_diff'], temp['unit'])})."
+                )
+
+        elif step in _QUARK_SEP_STEPS:
+            upstream_note = (
+                ", observed after fermentation differences in earlier steps"
+                if (not is_first and first_step in _QUARK_FERM_STEPS)
+                else ""
+            )
+            parts = []
+            if spd:
+                parts.append(
+                    f"centrifuge speed {d(spd['mean_diff'], 'higher', 'lower')} "
+                    f"({fmt(spd['mean_diff'], spd['unit'])})"
+                )
+            if dp:
+                parts.append(
+                    f"separation ΔP {d(dp['mean_diff'], 'higher', 'lower')} "
+                    f"({fmt(dp['mean_diff'], dp['unit'])})"
+                )
+            if parts:
+                bullets.append(
+                    f"Separation metrics differ from reference: {'; '.join(parts)}"
+                    + upstream_note + "."
+                )
+            if ph and len(bullets) < 2:
+                dr = d(ph["mean_diff"], "higher", "lower")
+                bullets.append(
+                    f"Post-separation pH is {dr} ({fmt(ph['mean_diff'], ph['unit'])})."
+                )
+
+        else:
+            sig = diverging[0]
+            bullets.append(
+                f"{sig['label']} is {d(sig['mean_diff'])} than reference "
+                f"({fmt(sig['mean_diff'], sig['unit'])}) in the "
+                f"{step.replace('_', ' ')} step."
+            )
+
+    elif product == "HIGH_PROTEIN_PUDDING":
+        dT       = next((s for s in diverging if s["col"] == "deltaT_heat_exchanger"), None)
+        pressure = next((s for s in diverging if s["col"] == "pressure_bar"), None)
+        flow     = next((s for s in diverging if s["col"] == "flow_rate_lpm"), None)
+        temp     = next((s for s in diverging if s["col"] == "temperature_C"), None)
+
+        if step in _PUDDING_THERMAL_STEPS:
+            if dT:
+                dr = d(dT["mean_diff"], "higher", "lower")
+                bullets.append(
+                    f"Heat exchanger ΔT is {dr} than reference "
+                    f"({fmt(dT['mean_diff'], dT['unit'])}), consistent with a difference "
+                    f"in heat transfer during this step."
+                )
+            hyd: list[str] = []
+            if pressure:
+                hyd.append(
+                    f"pressure {d(pressure['mean_diff'], 'elevated', 'reduced')} "
+                    f"({fmt(pressure['mean_diff'], pressure['unit'])})"
+                )
+            if flow:
+                hyd.append(
+                    f"flow {d(flow['mean_diff'], 'elevated', 'reduced')} "
+                    f"({fmt(flow['mean_diff'], flow['unit'])})"
+                )
+            if hyd and len(bullets) < 2:
+                bullets.append(
+                    f"Hydraulic signals suggest a process difference: {'; '.join(hyd)}."
+                )
+            if temp and not dT and len(bullets) < 2:
+                dr = d(temp["mean_diff"], "higher", "lower")
+                bullets.append(
+                    f"Process temperature is {dr} than reference "
+                    f"({fmt(temp['mean_diff'], temp['unit'])})."
+                )
+
+        else:
+            upstream_note = (
+                ", consistent with effects propagating from earlier thermal steps"
+                if (not is_first and first_step in _PUDDING_THERMAL_STEPS)
+                else ""
+            )
+            parts = [
+                f"{s['label']} {d(s['mean_diff'])} ({fmt(s['mean_diff'], s['unit'])})"
+                for s in diverging[:2]
+            ]
+            if parts:
+                bullets.append(
+                    f"Downstream differences: {', '.join(parts)}"
+                    + upstream_note + "."
+                )
+
+    return bullets[:2]
 
 
 def _render_divergence_panel(
     df_run:        pd.DataFrame,
     df_baseline:   pd.DataFrame,
     product:       str,
-    x_range:       tuple[float, float] | None,
+    x_range:       tuple[float, float] | None,  # kept for call-site compat; not used
     selected_step: str,
 ) -> None:
-    """Ranked divergence callouts + one-sentence plain-English summary."""
-    signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
-    metrics = _compute_divergence_metrics(df_run, df_baseline, signals, x_range)
-    if not metrics:
+    """Step-anchored divergence narrative.
+
+    Scans steps chronologically to find where the run first diverges from the
+    NORMAL reference, then describes subsequent divergent steps as downstream
+    observations — not as causes.
+    """
+    signals     = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+    step_results = _analyze_step_divergence(df_run, df_baseline, signals)
+    if not step_results:
         return
 
-    window_label = (
-        selected_step.replace("_", " ").capitalize()
-        if selected_step != "full_run"
-        else "Full run"
-    )
+    st.subheader("Where this run diverges from reference (and what happens next)")
 
-    st.subheader("Why it differs")
+    first_div = next((sr for sr in step_results if sr["diverges"]), None)
+
+    if first_div is None:
+        with st.container(border=True):
+            st.caption("No significant divergence from the NORMAL reference detected across all steps.")
+        return
+
+    first_step = first_div["step"]
+
     with st.container(border=True):
-        st.caption(f"vs NORMAL baseline  ·  window: {window_label}")
+        step_label = first_step.replace("_", " ").capitalize()
+        st.markdown(f"**First detectable divergence:** *{step_label}*")
+        st.divider()
 
-        # Top-3 ranked callouts
-        for r in metrics[:3]:
-            direc      = "above" if r["mean_diff"] > 0 else "below"
-            drift_note = ""
-            if r["slope_norm"] > 0.6 and abs(r["slope_diff"]) > 1e-9:
-                drift_note = (
-                    ";  divergence widening" if r["slope_diff"] > 0
-                    else ";  divergence narrowing"
-                )
-            st.markdown(
-                f"**{r['label']}** — mean {direc} baseline by "
-                f"{abs(r['mean_diff']):.3g} {r['unit']}; "
-                f"max Δ = {r['max_abs_diff']:.3g} {r['unit']}"
-                + drift_note
-            )
+        for sr in step_results:
+            if not sr["diverges"]:
+                continue
 
-        # One-sentence plain-English summary from the top driver
-        top   = metrics[0]
-        direc = "above" if top["mean_diff"] > 0 else "below"
-        if top["slope_norm"] > 0.8 and abs(top["slope_diff"]) > 1e-9:
-            gap = "widening" if top["slope_diff"] > 0 else "narrowing"
-            summary = (
-                f"{top['label']} is the primary divergence driver: "
-                f"it averaged {abs(top['mean_diff']):.3g} {top['unit']} {direc} "
-                f"baseline with a {gap} gap, peaking at "
-                f"{top['max_abs_diff']:.3g} {top['unit']}."
-            )
-        else:
-            summary = (
-                f"{top['label']} is the primary divergence driver: "
-                f"it averaged {abs(top['mean_diff']):.3g} {top['unit']} {direc} "
-                f"baseline, with a peak deviation of "
-                f"{top['max_abs_diff']:.3g} {top['unit']}."
-            )
-        st.info(summary)
+            is_first  = (sr["step"] == first_step)
+            is_zoomed = (selected_step == sr["step"])
+            sl        = sr["step"].replace("_", " ").capitalize()
+
+            header = f"**{sl}**"
+            if is_zoomed:
+                header += " _(currently zoomed)_"
+            if not is_first:
+                header += " _(downstream)_"
+            st.markdown(header)
+
+            bullets = _step_bullets(sr["step"], product, sr["sigs"], is_first, first_step)
+            if bullets:
+                for b in bullets:
+                    st.markdown(f"  - {b}")
+            else:
+                for sig in [s for s in sr["sigs"] if s["diverges"]][:2]:
+                    dr = "above" if sig["mean_diff"] > 0 else "below"
+                    st.markdown(
+                        f"  - {sig['label']} differs from reference "
+                        f"({sig['mean_diff']:+.3g} {sig['unit']})."
+                    )
+
+        st.divider()
+        st.caption(
+            "Observations are relative to the NORMAL reference run. "
+            "Differences in an earlier step are *consistent with*, but do not "
+            "establish, a causal relationship with changes observed later."
+        )
 
 
 # ── Right panel ───────────────────────────────────────────────────────────────
