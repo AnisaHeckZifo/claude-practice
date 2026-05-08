@@ -2370,16 +2370,34 @@ def _render_right_panel(
                 sep  = _compute_quark_sep_score(df_run)
                 f_stab = _anomaly_to_stability(ferm[0]) if ferm else 100
                 s_stab = _anomaly_to_stability(sep[0])  if sep  else 100
-                f_status, f_badge = _score_status(ferm[0]) if ferm else ("Normal", "✅ Normal")
-                s_status, s_badge = _score_status(sep[0])  if sep  else ("Normal", "✅ Normal")
-                o1.metric("Ferm. Stability",  f"{f_stab} / 100")
-                o2.metric("Sep. Stability",   f"{s_stab} / 100")
-                _STATUS_FN[f_status](f_badge)
-                _STATUS_FN[s_status](s_badge)
+                o1.metric(
+                    "Ferm. Stability",
+                    f"{f_stab} / 100",
+                    help=(
+                        "Fermentation stability: compares fermentation pH behaviour "
+                        "vs stable runs (upstream). 100 = fully stable."
+                    ),
+                )
+                o2.metric(
+                    "Sep. Stability",
+                    f"{s_stab} / 100",
+                    help=(
+                        "Separation stability: compares separation signals vs stable "
+                        "runs (downstream). An elevated score here is not a "
+                        "fermentation root cause."
+                    ),
+                )
+                st.caption("ML status details are shown in the Early Warning section below.")
             else:
-                stab, status, badge = _compute_run_stability(df_run, product)
-                o1.metric("Run Stability Score", f"{stab} / 100")
-                _STATUS_FN[status](badge)
+                stab, _, _ = _compute_run_stability(df_run, product)
+                o1.metric(
+                    "Run Stability Score",
+                    f"{stab} / 100",
+                    help=(
+                        "Run stability: how closely this run's heating and holding "
+                        "patterns match stable runs. 100 = fully stable."
+                    ),
+                )
             o2.metric("Extra CIP", "Yes" if run_row["extra_cleaning"] else "No")
         else:
             o2.metric("Extra CIP", "Yes" if run_row["extra_cleaning"] else "No")
