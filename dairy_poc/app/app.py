@@ -86,6 +86,13 @@ _PUDDING_EVENTS: frozenset[str] = frozenset({
     "filling_start", "CIP", "maintenance",
 })
 
+# Repeating color palette for step bands in the process timeline
+_STEP_PALETTE: list[str] = [
+    "#BBDEFB", "#C8E6C9", "#FFE0B2", "#F8BBD9",
+    "#E1BEE7", "#B2EBF2", "#FFF9C4", "#FFCCBC",
+    "#D7CCC8", "#CFD8DC",
+]
+
 # Short display labels for annotation text on the chart
 _EVENT_SHORT: dict[str, str] = {
     "inoculation":           "Inoc.",
@@ -476,7 +483,9 @@ def render_main(
 
     with col_main:
         _render_run_header(run_row, story)
-        _render_timeline_placeholder(run_ts)
+        # Read step-zoom state before the radio widget is drawn (timeline is above it)
+        selected_step = st.session_state.get(f"step_zoom_{run_id}", "full_run")
+        _render_process_timeline(run_ts, run_evts, selected_step)
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
@@ -505,30 +514,114 @@ def _render_run_header(run_row: pd.Series, story: dict | None) -> None:
     st.divider()
 
 
-# ── Timeline placeholder ──────────────────────────────────────────────────────
+# ── Process timeline ──────────────────────────────────────────────────────────
 
-def _render_timeline_placeholder(run_ts: pd.DataFrame) -> None:
-    steps    = run_ts["step"].unique().tolist() if not run_ts.empty else []
-    n_rows   = len(run_ts)
-    dur_min  = float(run_ts["t_min"].max()) if not run_ts.empty else 0.0
+def _render_process_timeline(
+    run_ts:        pd.DataFrame,
+    run_evts:      pd.DataFrame,
+    selected_step: str,
+) -> None:
+    """Horizontal step-band timeline with event tick markers.
 
+    Each step is a colored rectangle; width = duration in t_min.
+    The currently zoomed step (selected_step) is highlighted; all others dim.
+    Events appear as thin vertical ticks with hover tooltips.
+    """
     st.subheader("Process timeline")
-    with st.container(border=True):
-        st.caption(
-            f"Placeholder — {n_rows:,} timeseries rows  ·  "
-            f"{dur_min:.0f} min  ·  steps: {', '.join(steps)}"
+
+    if run_ts.empty:
+        st.caption("No timeseries data for this run.")
+        return
+
+    windows = _compute_step_windows(run_ts)
+    if not windows:
+        return
+
+    t_max      = float(run_ts["t_min"].max())
+    label_min  = t_max * 0.045   # only label steps wider than 4.5% of full run
+
+    fig = go.Figure()
+
+    # ── Step bands ────────────────────────────────────────────────────────────
+    for idx, (step, start, end) in enumerate(windows):
+        color      = _STEP_PALETTE[idx % len(_STEP_PALETTE)]
+        is_sel     = (selected_step == step)
+        # dim non-selected when a specific step is zoomed
+        opacity    = 1.0 if (selected_step == "full_run" or is_sel) else 0.30
+        border_col = "#1a1a1a" if is_sel else "#aaaaaa"
+        border_w   = 2.0       if is_sel else 0.5
+
+        fig.add_shape(
+            type="rect",
+            x0=start, x1=end, y0=0, y1=1,
+            fillcolor=color,
+            opacity=opacity,
+            line=dict(color=border_col, width=border_w),
+            layer="below",
         )
-        st.info(
-            "Chart will go here: step-shaded timeline with sensor overlays "
-            "(temperature, pH, separator_speed_rpm, fouling_index …)."
-        )
-        if not run_ts.empty:
-            st.dataframe(
-                run_ts[["t_min", "step", "temperature_C", "pH", "anomaly_flag"]]
-                .head(5),
-                use_container_width=True,
-                hide_index=True,
+
+        # Label: only when the band is wide enough to hold text
+        if (end - start) >= label_min:
+            raw   = step.replace("_", " ")
+            label = raw if len(raw) <= 15 else raw[:13] + "…"
+            fig.add_annotation(
+                x=(start + end) / 2, y=0.5,
+                text=label,
+                showarrow=False,
+                font=dict(size=9, color="#333333"),
+                opacity=1.0 if (selected_step == "full_run" or is_sel) else 0.45,
+                xanchor="center",
+                yanchor="middle",
             )
+
+    # ── Event tick markers ────────────────────────────────────────────────────
+    if not run_evts.empty:
+        for _, erow in run_evts.iterrows():
+            fig.add_shape(
+                type="line",
+                x0=float(erow["t_min"]), x1=float(erow["t_min"]),
+                y0=0, y1=1,
+                line=dict(color="#333333", width=1.2),
+                layer="above",
+            )
+
+        # Invisible scatter — one point per event, positioned above the band
+        # for hover tooltips (shapes don't emit hover events in Plotly)
+        fig.add_trace(go.Scatter(
+            x=[float(r["t_min"])  for _, r in run_evts.iterrows()],
+            y=[1.06]              * len(run_evts),
+            mode="markers",
+            marker=dict(symbol="triangle-down", size=7, color="#333333"),
+            hovertemplate=[
+                f"<b>{r['event_type']}</b><br>t = {r['t_min']:.1f} min<extra></extra>"
+                for _, r in run_evts.iterrows()
+            ],
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        height=95,
+        margin=dict(l=8, r=8, t=2, b=26),
+        xaxis=dict(
+            range=[-t_max * 0.005, t_max * 1.01],
+            showticklabels=True,
+            ticksuffix=" min",
+            showgrid=False,
+            zeroline=False,
+            title=None,
+        ),
+        yaxis=dict(
+            range=[0, 1.18],      # headroom for the event triangle markers
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 # ── Right panel ───────────────────────────────────────────────────────────────
