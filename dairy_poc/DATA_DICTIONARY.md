@@ -80,21 +80,18 @@ not a time-series. Join to `runs.csv` on `run_id`.
 | Column | Type | Unit | Products | Description |
 |---|---|---|---|---|
 | `run_id` | string | — | both | Foreign key → runs.csv |
+| `product` | category | — | both | `QUARK` or `HIGH_PROTEIN_PUDDING` |
 | `sample_time` | datetime | ISO 8601 | both | When sample was drawn (typically end of filling step) |
 | `protein_pct` | float | % | both | Protein content. Quark target 10–14 %; Pudding 8–15 % |
-| `fat_pct` | float | % | both | Fat content. Quark Magerquark 0.05–0.5 %; Pudding varies |
 | `total_solids_pct` | float | % | both | Total solids. Quark 18–23 %; Pudding 20–28 % |
-| `viscosity_cP` | float | cP | both | Brookfield / rheometer. Quark 4000–15000 cP; Pudding 2000–8000 cP |
-| `texture_score` | float | 0–100 | both | Composite textural QC score (firmness, spreadability, mouthfeel) |
-| `final_pH` | float | — | Quark | End-of-fermentation pH; target 4.4–4.7 |
-| `fermentation_time_hr` | float | h | Quark | Actual hours from inoculation to target pH |
-| `whey_protein_loss_proxy` | float \| null | fraction | Quark | Fraction of input whey protein lost to permeate; optional instrumented KPI |
-| `microbial_count_cfu` | float | CFU/mL | both | Aerobic plate count; food-safety gate |
-| `fouling_index_end` | float \| null | 0–1 | Pudding | Estimated fouling severity at run end (from deltaT model); null for Quark |
+| `viscosity_value` | float | cP | both | Brookfield / rheometer viscosity. Quark 4000–15000 cP; Pudding 2000–8000 cP |
+| `final_pH_offline` | float | — | both | Offline pH measurement. Quark: end-of-fermentation pH, target 4.4–4.7. Pudding: post-heat-treatment pH, target 6.3–7.0 |
+| `d50_um` | float | µm | both | D50 particle size by laser diffraction. Quark: curd particles after centrifugation, normal ~28 µm; Pudding: starch granules + protein aggregates, normal ~14 µm. Elevated in SEPARATION_ISSUE (Quark) and FOUL (Pudding) |
+| `fermentation_time_hr` | float \| null | h | Quark | Actual hours from inoculation to target pH; 99.0 = sentinel for STALL_FERMENT (run did not complete); null for Pudding |
 | `result_flag` | category | `PASS`, `WARN`, `FAIL` | both | Overall QC verdict vs. spec_limits in YAML |
 
-**Quark-specific spec limits:** protein 10–14 %, final pH 4.4–4.7, fermentation time 10–16 h.
-**Pudding-specific spec limits:** protein 8–15 %, pH 6.3–7.0, fouling_index_end < 0.35.
+**Quark spec limits:** protein 10–14 %, total solids 18–23 %, viscosity 4000–15000 cP, final pH 4.4–4.7, fermentation time 10–16 h, D50 10–50 µm.
+**Pudding spec limits:** protein 8–15 %, total solids 20–28 %, viscosity 2000–8000 cP, final pH 6.3–7.0, D50 5–25 µm.
 
 ---
 

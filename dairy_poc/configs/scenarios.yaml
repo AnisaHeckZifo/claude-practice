@@ -149,14 +149,12 @@ products:
 
     # Spec limits — final product (run-level)
     spec_limits:
-      protein_pct:            { lo: 10.0, hi: 14.0, unit: "%" }
-      total_solids_pct:       { lo: 18.0, hi: 23.0, unit: "%" }
-      fat_pct:                { lo: 0.05, hi: 0.5,  unit: "%" }          # Magerquark target
-      final_pH:               { lo: 4.4,  hi: 4.7,  unit: "—" }
-      fermentation_time_hr:   { lo: 10.0, hi: 16.0, unit: "h" }
-      viscosity_cP:           { lo: 4000, hi: 15000,unit: "cP" }
-      texture_score:          { lo: 60,   hi: 90,   unit: "0–100" }
-      whey_protein_loss_proxy: { lo: 0.0,  hi: 0.15, unit: "fraction", optional: true }
+      protein_pct:          { lo: 10.0, hi: 14.0,  unit: "%" }
+      total_solids_pct:     { lo: 18.0, hi: 23.0,  unit: "%" }
+      viscosity_value:      { lo: 4000, hi: 15000,  unit: "cP" }
+      final_pH_offline:     { lo: 4.4,  hi: 4.7,   unit: "—" }
+      fermentation_time_hr: { lo: 10.0, hi: 16.0,  unit: "h" }
+      d50_um:               { lo: 10.0, hi: 50.0,  unit: "µm" }
 
     # Run-level fields recorded once per run (in runs.csv)
     run_level_fields:
@@ -285,12 +283,11 @@ products:
 
     # Spec limits — final product (run-level)
     spec_limits:
-      protein_pct:         { lo: 8.0,  hi: 15.0, unit: "%" }
-      total_solids_pct:    { lo: 20.0, hi: 28.0, unit: "%" }
-      pH:                  { lo: 6.3,  hi: 7.0,  unit: "—" }
-      viscosity_cP:        { lo: 2000, hi: 8000, unit: "cP" }
-      texture_score:       { lo: 55,   hi: 85,   unit: "0–100" }
-      fouling_index_end:   { lo: 0.0,  hi: 0.35, unit: "0–1", optional: true }
+      protein_pct:      { lo: 8.0,  hi: 15.0,  unit: "%" }
+      total_solids_pct: { lo: 20.0, hi: 28.0,  unit: "%" }
+      viscosity_value:  { lo: 2000, hi: 8000,   unit: "cP" }
+      final_pH_offline: { lo: 6.3,  hi: 7.0,   unit: "—" }
+      d50_um:           { lo: 5.0,  hi: 25.0,  unit: "µm" }
 
     # Run-level fields recorded once per run (in runs.csv)
     run_level_fields:

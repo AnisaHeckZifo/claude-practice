@@ -28,69 +28,67 @@ def _quark_lab(run_meta: dict, rng: np.random.Generator) -> dict:
     # ── Base values (NORMAL / no-fault) ──────────────────────────────────────
     protein_pct      = rng.normal(11.8, 0.40)
     total_solids_pct = rng.normal(20.5, 0.50)
-    fat_pct          = rng.normal(0.25, 0.05)
-    viscosity_cP     = rng.normal(9000, 600.0)
-    texture_score    = rng.normal(74.0, 5.0)
-    microbial_cfu    = max(0.0, rng.normal(18.0, 7.0))
-    whey_prot_loss   = max(0.0, rng.normal(0.07, 0.02))
+    viscosity_value  = rng.normal(9000, 600.0)
+    d50_um           = rng.normal(28.0, 3.5)   # curd particle D50 after centrifugation
 
     # ── Fermentation outcome ──────────────────────────────────────────────────
     if scenario == "STALL_FERMENT":
-        final_pH = rng.normal(5.5, 0.05)
-        ferm_hr  = 99.0                         # sentinel: run did not complete
+        final_pH_offline = rng.normal(5.5, 0.05)
+        ferm_hr          = 99.0                 # sentinel: run did not complete
     elif scenario == "OVER_ACID":
-        final_pH = float(rng.uniform(4.10, 4.35))
-        ferm_hr  = rng.normal(11.5, 0.5)
+        final_pH_offline = float(rng.uniform(4.10, 4.35))
+        ferm_hr          = rng.normal(11.5, 0.5)
     elif scenario == "SLOW_FERMENT":
-        final_pH = rng.normal(4.63, 0.06)
-        ferm_hr  = rng.normal(15.5, 0.8)
+        final_pH_offline = rng.normal(4.63, 0.06)
+        ferm_hr          = rng.normal(15.5, 0.8)
     else:
         # Higher raw_protein_pct → marginally faster fermentation
-        rate_adj = 1.0 + 0.15 * (raw_prot - 3.2)
-        final_pH = rng.normal(4.52, 0.04)
-        ferm_hr  = rng.normal(13.0 / rate_adj, 0.5)
+        rate_adj         = 1.0 + 0.15 * (raw_prot - 3.2)
+        final_pH_offline = rng.normal(4.52, 0.04)
+        ferm_hr          = rng.normal(13.0 / rate_adj, 0.5)
 
     # ── Scenario-specific adjustments ────────────────────────────────────────
 
     if scenario == "SEPARATION_ISSUE":
         # Under-concentrated; gel-break spread compounds the protein miss
-        protein_pct    = rng.normal(9.5, 0.5 + 0.08 * gel_excess)
-        whey_prot_loss = float(rng.uniform(0.15, 0.40))
+        protein_pct      = rng.normal(9.5, 0.5 + 0.08 * gel_excess)
         total_solids_pct -= rng.uniform(1.0, 3.0)
+        d50_um            = rng.normal(44.0, 6.0)   # larger particles: whey not removed
 
     elif scenario == "STANDARDIZATION_OFFTARGET":
         # Wide spread on protein, mean stays close to target
         protein_pct = rng.normal(11.5, 1.2 + 0.08 * gel_excess)
 
     elif scenario == "OVER_ACID":
-        viscosity_cP  = rng.normal(6500, 800.0)  # over-acid curd is softer
-        texture_score = rng.normal(44.0, 7.0)
+        viscosity_value = rng.normal(6500, 800.0)   # over-acid curd is softer
+        d50_um          = rng.normal(18.0, 2.5)     # finer particles from over-syneresis
 
     elif scenario == "STALL_FERMENT":
-        # Scrapped run: composition is unreliable
-        protein_pct      = rng.normal(6.5, 1.2)  # not concentrated
+        # Scrapped run: gel did not form; composition is unreliable
+        protein_pct      = rng.normal(6.5, 1.2)
         total_solids_pct = rng.normal(12.0, 1.5)
-        viscosity_cP     = rng.normal(1500, 400.0)
-        texture_score    = rng.normal(20.0, 8.0)
+        viscosity_value  = rng.normal(1500, 400.0)
+        d50_um           = rng.normal(52.0, 9.0)    # large, undeveloped curd fragments
+
+    elif scenario == "SLOW_FERMENT":
+        d50_um = rng.normal(34.0, 4.0)   # under-developed gel → larger particles
 
     elif scenario == "RAW_MAT_VAR":
         # Protein content tracks raw material; not a fault per se
         protein_pct += (raw_prot - 3.2) * 1.5
+        d50_um      -= (raw_prot - 3.2) * 2.0   # higher protein → firmer gel → smaller D50
 
-    # Gel break adds spread to protein_pct via standardization variance
+    # Longer gel break → additional spread on protein; mechanical breakdown reduces D50
     protein_pct += rng.normal(0.0, 0.08 * gel_excess)
+    d50_um      -= rng.normal(0.0, 1.0 * gel_excess)
 
     return {
-        "protein_pct":            round(float(protein_pct),      3),
-        "fat_pct":                round(float(fat_pct),          4),
-        "total_solids_pct":       round(float(total_solids_pct), 3),
-        "viscosity_cP":           round(float(viscosity_cP),     1),
-        "texture_score":          round(float(np.clip(texture_score, 0.0, 100.0)), 2),
-        "microbial_count_cfu":    round(float(microbial_cfu),    2),
-        "final_pH":               round(float(final_pH),         3),
-        "fermentation_time_hr":   round(float(ferm_hr),          2),
-        "whey_protein_loss_proxy":round(float(whey_prot_loss),   4),
-        "fouling_index_end":      None,
+        "protein_pct":          round(float(protein_pct),          3),
+        "total_solids_pct":     round(float(total_solids_pct),      3),
+        "viscosity_value":      round(float(viscosity_value),       1),
+        "final_pH_offline":     round(float(final_pH_offline),      3),
+        "d50_um":               round(float(max(2.0, d50_um)),      2),
+        "fermentation_time_hr": round(float(ferm_hr),               2),
     }
 
 
@@ -102,35 +100,30 @@ def _pudding_lab(run_meta: dict, rng: np.random.Generator) -> dict:
 
     protein_pct      = rng.normal(12.5, 0.6)
     total_solids_pct = rng.normal(24.0, 0.8)
-    fat_pct          = rng.normal(2.5,  0.2)
-    viscosity_cP     = rng.normal(4800, 400.0)
-    texture_score    = rng.normal(69.0, 5.0)
-    microbial_cfu    = max(0.0, rng.normal(15.0, 6.0))
-    fouling_idx_end  = float(rng.uniform(0.0, 0.05))   # near-zero for clean runs
+    viscosity_value  = rng.normal(4800, 400.0)
+    final_pH_offline = rng.normal(6.65, 0.05)   # heat-set product; near-neutral
+    d50_um           = rng.normal(14.0, 1.5)    # starch granules + protein aggregates
 
     if scenario == "FOUL":
-        viscosity_cP    = rng.normal(4200, 500.0)     # slight heat damage
-        fouling_idx_end = float(rng.uniform(0.25, 0.55))
+        viscosity_value  = rng.normal(4200, 500.0)   # slight heat damage
+        final_pH_offline = rng.normal(6.52, 0.06)    # Maillard → marginally lower pH
+        d50_um           = rng.normal(18.5, 2.5)     # over-gelatinised starch → larger
 
     elif scenario == "BLOCK":
-        protein_pct     = rng.normal(11.8, 0.9)       # less controlled fill
-        fouling_idx_end = float(rng.uniform(0.05, 0.20))
+        protein_pct = rng.normal(11.8, 0.9)          # less controlled fill
+        d50_um      = rng.normal(16.0, 3.5)          # thermal non-uniformity → wider D50
 
     elif scenario == "RAW_MAT_VAR":
-        protein_pct  += (raw_prot - 3.2) * 1.2
-        viscosity_cP += (raw_prot - 3.2) * 80.0
+        protein_pct     += (raw_prot - 3.2) * 1.2
+        viscosity_value += (raw_prot - 3.2) * 80.0
 
     return {
-        "protein_pct":            round(float(protein_pct),      3),
-        "fat_pct":                round(float(fat_pct),          4),
-        "total_solids_pct":       round(float(total_solids_pct), 3),
-        "viscosity_cP":           round(float(viscosity_cP),     1),
-        "texture_score":          round(float(np.clip(texture_score, 0.0, 100.0)), 2),
-        "microbial_count_cfu":    round(float(microbial_cfu),    2),
-        "final_pH":               None,
-        "fermentation_time_hr":   None,
-        "whey_protein_loss_proxy":None,
-        "fouling_index_end":      round(float(fouling_idx_end),  4),
+        "protein_pct":          round(float(protein_pct),      3),
+        "total_solids_pct":     round(float(total_solids_pct), 3),
+        "viscosity_value":      round(float(viscosity_value),  1),
+        "final_pH_offline":     round(float(final_pH_offline), 3),
+        "d50_um":               round(float(max(2.0, d50_um)), 2),
+        "fermentation_time_hr": None,
     }
 
 
@@ -140,8 +133,8 @@ def _spec_flag(row: dict, product: str) -> str:
     spec    = _CFG["products"][product]["spec_limits"]
     fails   = 0
     warns   = 0
-    _CHECKS = ["protein_pct", "total_solids_pct", "viscosity_cP",
-               "final_pH", "fermentation_time_hr"]
+    _CHECKS = ["protein_pct", "total_solids_pct", "viscosity_value",
+               "final_pH_offline", "fermentation_time_hr", "d50_um"]
 
     for col in _CHECKS:
         if col not in spec:

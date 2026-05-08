@@ -2408,20 +2408,14 @@ def _render_lab_metrics(lab_row: pd.Series, product: str) -> None:
     """Show the most relevant lab values as compact metrics."""
     st.metric("Protein",      f"{lab_row['protein_pct']:.2f} %")
     st.metric("Total solids", f"{lab_row['total_solids_pct']:.2f} %")
-    st.metric("Viscosity",    f"{lab_row['viscosity_cP']:.0f} cP")
-    st.metric("Texture score",f"{lab_row['texture_score']:.1f} / 100")
+    st.metric("Viscosity",    f"{lab_row['viscosity_value']:.0f} cP")
+    st.metric("pH (offline)", f"{lab_row['final_pH_offline']:.3f}")
+    st.metric("D50 particle", f"{lab_row['d50_um']:.1f} µm")
 
-    if product == "QUARK" and pd.notna(lab_row.get("final_pH")):
-        c1, c2 = st.columns(2)
-        c1.metric("Final pH",        f"{lab_row['final_pH']:.3f}")
+    if product == "QUARK":
         ferm = lab_row.get("fermentation_time_hr")
-        c2.metric("Ferm. time", "DNF" if ferm == 99.0 else f"{ferm:.1f} h")
-        wpl = lab_row.get("whey_protein_loss_proxy")
-        if pd.notna(wpl):
-            st.metric("Whey protein loss", f"{wpl:.4f}")
-
-    if product == "HIGH_PROTEIN_PUDDING" and pd.notna(lab_row.get("fouling_index_end")):
-        st.metric("Fouling index (end)", f"{lab_row['fouling_index_end']:.4f}")
+        if ferm is not None and pd.notna(ferm):
+            st.metric("Ferm. time", "DNF" if ferm == 99.0 else f"{ferm:.1f} h")
 
 
 # =============================================================================
