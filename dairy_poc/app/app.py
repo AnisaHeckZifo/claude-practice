@@ -102,6 +102,21 @@ _EVENT_SHORT: dict[str, str] = {
 }
 
 
+def _compute_step_windows(
+    run_ts: pd.DataFrame,
+) -> list[tuple[str, float, float]]:
+    """Return (step, start_t_min, end_t_min) for each step in first-appearance order."""
+    if run_ts.empty:
+        return []
+    first_t = run_ts.groupby("step")["t_min"].min()
+    ordered = first_t.sort_values().index.tolist()
+    bounds  = run_ts.groupby("step")["t_min"].agg(start="min", end="max")
+    return [
+        (step, float(bounds.loc[step, "start"]), float(bounds.loc[step, "end"]))
+        for step in ordered
+    ]
+
+
 def _add_event_markers(
     fig:    go.Figure,
     evts:   pd.DataFrame,
@@ -158,6 +173,7 @@ def _make_signal_chart(
     color:      str,
     show_xaxis: bool = False,
     evts:       pd.DataFrame | None = None,
+    x_range:    tuple[float, float] | None = None,
 ) -> go.Figure:
     """Return a single compact Plotly line chart for one sensor signal."""
     fig = go.Figure()
@@ -189,6 +205,8 @@ def _make_signal_chart(
         plot_bgcolor="white",
         paper_bgcolor="white",
     )
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
     if evts is not None and not evts.empty:
         _add_event_markers(fig, evts, col, df_run)
     return fig
@@ -202,7 +220,6 @@ def render_signal_charts(
     """Render one Plotly line chart per signal, stacked vertically."""
     signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
 
-    # Keep only signals that exist in the DataFrame and have at least one value
     renderable = [
         sig for sig in signals
         if sig[0] in df_run.columns and not df_run[sig[0]].isna().all()
@@ -214,15 +231,47 @@ def render_signal_charts(
         st.info("No signal data available for this run.")
         return
 
-    evt_filter  = _QUARK_EVENTS if product == "QUARK" else _PUDDING_EVENTS
+    # ── Step selector ─────────────────────────────────────────────────────────
+    windows    = _compute_step_windows(df_run)
+    run_id_key = df_run["run_id"].iloc[0]
+    step_opts  = ["full_run"] + [step for step, _, _ in windows]
+
+    sel_step = st.radio(
+        "Step zoom",
+        options=step_opts,
+        format_func=lambda s: "Full run" if s == "full_run"
+                              else s.replace("_", " ").capitalize(),
+        horizontal=True,
+        key=f"step_zoom_{run_id_key}",
+        label_visibility="collapsed",
+    )
+
+    # ── X-range for selected step (1-min padding each side) ───────────────────
+    if sel_step == "full_run":
+        x_range: tuple[float, float] | None = None
+    else:
+        win_map        = {step: (s, e) for step, s, e in windows}
+        step_s, step_e = win_map[sel_step]
+        x_range        = (step_s - 1.0, step_e + 1.0)
+
+    # ── Event filtering — keep only events visible in the current x-range ─────
+    evt_filter   = _QUARK_EVENTS if product == "QUARK" else _PUDDING_EVENTS
     evts_to_show = run_evts[run_evts["event_type"].isin(evt_filter)]
 
+    if x_range is not None:
+        evts_to_show = evts_to_show[
+            (evts_to_show["t_min"] >= x_range[0]) &
+            (evts_to_show["t_min"] <= x_range[1])
+        ]
+
+    # ── Chart loop — same x_range applied to every panel ──────────────────────
     for i, (col, label, unit, color) in enumerate(renderable):
         is_last = (i == len(renderable) - 1)
         fig = _make_signal_chart(
             df_run, col, label, unit, color,
             show_xaxis=is_last,
             evts=evts_to_show,
+            x_range=x_range,
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
