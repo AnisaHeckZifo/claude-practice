@@ -837,7 +837,9 @@ def _render_score_trend_chart(
     first_watch = next((float(t) for t, s in zip(t_vis, s_vis) if s >= _ML_WATCH_THRESH), None)
     first_high  = next((float(t) for t, s in zip(t_vis, s_vis) if s >= _ML_HIGH_THRESH),  None)
 
-    y_max = max(float(s_vis.max()) * 1.18, _ML_HIGH_THRESH * 1.2)
+    # y-axis ceiling: 10% above the taller of the peak score and the High threshold,
+    # plus 0.15 absolute so threshold labels drawn at "top right" never touch the axis edge.
+    y_max = max(float(s_vis.max()), _ML_HIGH_THRESH) * 1.1 + 0.15
 
     # ── Figure ────────────────────────────────────────────────────────────────
     fig = go.Figure()
@@ -852,7 +854,7 @@ def _render_score_trend_chart(
         showlegend=False,
     ))
 
-    # Threshold reference lines
+    # Threshold reference lines — labels go into the right margin (r=100)
     fig.add_hline(
         y=_ML_WATCH_THRESH,
         line_dash="dash", line_color="#FF9800", line_width=1.2,
@@ -868,7 +870,9 @@ def _render_score_trend_chart(
         annotation_font_size=8, annotation_font_color="#E53935",
     )
 
-    # First-warning annotation — High takes precedence over Watch
+    # First-warning annotation — High takes precedence over Watch.
+    # Anchor in paper coordinates (yref="paper") so the text stays in the
+    # visible area regardless of the data scale; ax/ay are pixel offsets.
     first_warn = first_high if first_high is not None else first_watch
     if first_warn is not None:
         fig.add_vline(x=first_warn, line_dash="dot", line_color="#E53935", line_width=1.5)
@@ -876,12 +880,21 @@ def _render_score_trend_chart(
         step_lbl = near["step"].iloc[0].replace("_", " ") if not near.empty else ""
         ann = f"first warning{' · ' + step_lbl if step_lbl else ''}"
         fig.add_annotation(
-            x=first_warn, y=y_max * 0.87,
+            x=first_warn,
+            xref="x",
+            y=0.88,
+            yref="paper",
             text=ann,
-            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1,
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1,
+            arrowwidth=1,
             arrowcolor="#E53935",
+            ax=12,
+            ay=-28,
+            axref="pixel",
+            ayref="pixel",
             font=dict(size=9, color="#E53935"),
-            xanchor="left",
             bgcolor="rgba(255,255,255,0.82)",
         )
 
@@ -912,8 +925,8 @@ def _render_score_trend_chart(
         ))
 
     fig.update_layout(
-        height=165,
-        margin=dict(l=8, r=8, t=4, b=36),
+        height=290,
+        margin=dict(l=62, r=100, t=50, b=40),
         xaxis=dict(title="t (min)", showgrid=True, gridcolor="#ebebeb", zeroline=False),
         yaxis=dict(
             title=f"Score ({_ML_TREND_WINDOW}-min window)",
