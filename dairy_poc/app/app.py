@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -527,18 +528,47 @@ def render_main(
     run_ts   = ts[ts["run_id"] == run_id]            # filter once; shared by chart renders
     run_evts = events[events["run_id"] == run_id]    # events for this run
 
+    # Read widget states from session_state before any widget is drawn.
+    # Both the timeline (above the radio) and the divergence panel (right col)
+    # need these values, so they must be resolved here.
+    selected_step = st.session_state.get(f"step_zoom_{run_id}", "full_run")
+    show_baseline = st.session_state.get(f"baseline_{run_id}", False)
+
+    # Resolve baseline DataFrame (mirrors logic in render_signal_charts)
+    df_baseline: pd.DataFrame | None = None
+    if show_baseline:
+        run_meta = runs[runs["run_id"] == run_id]
+        scale    = str(run_meta["scale"].iloc[0]) if not run_meta.empty else "PRODUCTION"
+        b_rid    = _find_baseline_run_id(runs, run_row["product"], scale)
+        if b_rid:
+            df_baseline = ts[ts["run_id"] == b_rid].copy()
+
+    # Resolve x_range from step-zoom state (mirrors logic in render_signal_charts)
+    windows = _compute_step_windows(run_ts)
+    if selected_step == "full_run":
+        x_range: tuple[float, float] | None = None
+    else:
+        win_map = {s: (s_t, e_t) for s, s_t, e_t in windows}
+        if selected_step in win_map:
+            step_s, step_e = win_map[selected_step]
+            x_range = (step_s - 1.0, step_e + 1.0)
+        else:
+            x_range = None
+
     # Build two-column layout: main content | right panel
     col_main, col_right = st.columns([2, 1], gap="large")
 
     with col_main:
         _render_run_header(run_row, story)
-        # Read step-zoom state before the radio widget is drawn (timeline is above it)
-        selected_step = st.session_state.get(f"step_zoom_{run_id}", "full_run")
         _render_process_timeline(run_ts, run_evts, selected_step)
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
         _render_right_panel(mode, run_row, lab_row, story)
+        if df_baseline is not None:
+            _render_divergence_panel(
+                run_ts, df_baseline, run_row["product"], x_range, selected_step,
+            )
 
 
 # ── Run header ────────────────────────────────────────────────────────────────
@@ -671,6 +701,149 @@ def _render_process_timeline(
     )
 
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+# ── Baseline divergence panel ────────────────────────────────────────────────
+
+def _compute_divergence_metrics(
+    df_run:      pd.DataFrame,
+    df_baseline: pd.DataFrame,
+    signals:     list[tuple[str, str, str, str]],
+    x_range:     tuple[float, float] | None,
+) -> list[dict]:
+    """Return per-signal divergence metrics, sorted by score descending.
+
+    Clips both DataFrames to x_range before computing.  Signals with fewer
+    than 2 non-null rows in either series are skipped.
+
+    Each result dict contains:
+      col, label, unit, mean_diff, std_diff, slope_diff, max_abs_diff,
+      mean_norm, slope_norm, score.
+    """
+    if x_range is not None:
+        lo, hi = x_range
+        sel = df_run[  (df_run["t_min"]   >= lo) & (df_run["t_min"]   <= hi)]
+        bas = df_baseline[(df_baseline["t_min"] >= lo) & (df_baseline["t_min"] <= hi)]
+    else:
+        sel = df_run
+        bas = df_baseline
+
+    rows: list[dict] = []
+    for col, label, unit, _ in signals:
+        if col not in sel.columns or col not in bas.columns:
+            continue
+
+        sv = sel[col].dropna()
+        bv = bas[col].dropna()
+        if len(sv) < 2 or len(bv) < 2:
+            continue
+
+        sv_arr = sv.values.astype(float)
+        bv_arr = bv.values.astype(float)
+        st_arr = sel.loc[sv.index, "t_min"].values.astype(float)
+        bt_arr = bas.loc[bv.index, "t_min"].values.astype(float)
+
+        mean_diff  = float(sv_arr.mean()) - float(bv_arr.mean())
+        std_diff   = float(sv_arr.std())  - float(bv_arr.std())
+        slope_diff = (float(np.polyfit(st_arr, sv_arr, 1)[0])
+                    - float(np.polyfit(bt_arr, bv_arr, 1)[0]))
+
+        # Point-wise |diff| on aligned t_min; fall back to |mean_diff| if no overlap
+        merged = (
+            sel[["t_min", col]].rename(columns={col: "s"})
+            .merge(bas[["t_min", col]].rename(columns={col: "b"}), on="t_min", how="inner")
+            .dropna()
+        )
+        max_abs_diff = (
+            float((merged["s"] - merged["b"]).abs().max())
+            if not merged.empty else abs(mean_diff)
+        )
+
+        rows.append({
+            "col": col, "label": label, "unit": unit,
+            "mean_diff": mean_diff, "std_diff": std_diff,
+            "slope_diff": slope_diff, "max_abs_diff": max_abs_diff,
+        })
+
+    if not rows:
+        return []
+
+    def _norm(vals: list[float]) -> list[float]:
+        arr = np.array(vals, dtype=float)
+        hi  = arr.max()
+        return (arr / hi).tolist() if hi > 0 else [0.0] * len(arr)
+
+    mn  = _norm([abs(r["mean_diff"])  for r in rows])
+    sn  = _norm([abs(r["slope_diff"]) for r in rows])
+    mxn = _norm([r["max_abs_diff"]    for r in rows])
+
+    for i, r in enumerate(rows):
+        r["mean_norm"]  = mn[i]
+        r["slope_norm"] = sn[i]
+        r["score"]      = 0.35 * mn[i] + 0.35 * sn[i] + 0.30 * mxn[i]
+
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
+
+def _render_divergence_panel(
+    df_run:        pd.DataFrame,
+    df_baseline:   pd.DataFrame,
+    product:       str,
+    x_range:       tuple[float, float] | None,
+    selected_step: str,
+) -> None:
+    """Ranked divergence callouts + one-sentence plain-English summary."""
+    signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+    metrics = _compute_divergence_metrics(df_run, df_baseline, signals, x_range)
+    if not metrics:
+        return
+
+    window_label = (
+        selected_step.replace("_", " ").capitalize()
+        if selected_step != "full_run"
+        else "Full run"
+    )
+
+    st.subheader("Why it differs")
+    with st.container(border=True):
+        st.caption(f"vs NORMAL baseline  ·  window: {window_label}")
+
+        # Top-3 ranked callouts
+        for r in metrics[:3]:
+            direc      = "above" if r["mean_diff"] > 0 else "below"
+            drift_note = ""
+            if r["slope_norm"] > 0.6 and abs(r["slope_diff"]) > 1e-9:
+                drift_note = (
+                    ";  divergence widening" if r["slope_diff"] > 0
+                    else ";  divergence narrowing"
+                )
+            st.markdown(
+                f"**{r['label']}** — mean {direc} baseline by "
+                f"{abs(r['mean_diff']):.3g} {r['unit']}; "
+                f"max Δ = {r['max_abs_diff']:.3g} {r['unit']}"
+                + drift_note
+            )
+
+        # One-sentence plain-English summary from the top driver
+        top   = metrics[0]
+        direc = "above" if top["mean_diff"] > 0 else "below"
+        if top["slope_norm"] > 0.8 and abs(top["slope_diff"]) > 1e-9:
+            gap = "widening" if top["slope_diff"] > 0 else "narrowing"
+            summary = (
+                f"{top['label']} is the primary divergence driver: "
+                f"it averaged {abs(top['mean_diff']):.3g} {top['unit']} {direc} "
+                f"baseline with a {gap} gap, peaking at "
+                f"{top['max_abs_diff']:.3g} {top['unit']}."
+            )
+        else:
+            summary = (
+                f"{top['label']} is the primary divergence driver: "
+                f"it averaged {abs(top['mean_diff']):.3g} {top['unit']} {direc} "
+                f"baseline, with a peak deviation of "
+                f"{top['max_abs_diff']:.3g} {top['unit']}."
+            )
+        st.info(summary)
 
 
 # ── Right panel ───────────────────────────────────────────────────────────────
