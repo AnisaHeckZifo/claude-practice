@@ -1065,11 +1065,11 @@ def _render_ml_explanation_expanders(product: str) -> None:
     )
     if is_quark:
         score_detail = (
-            "**Fermentation Health** captures pH trajectory and temperature patterns "
+            "**Fermentation Early Warning (ML)** captures pH trajectory and temperature patterns "
             "during inoculation and fermentation. "
-            "**Separation Stability** captures centrifuge speed and ΔP patterns "
+            "**Separation Early Warning (ML)** captures centrifuge speed and ΔP patterns "
             "during the separation phase. "
-            "These are independent scores — separation stability reflects "
+            "These are independent scores — separation early warning reflects "
             "downstream centrifugation behaviour, not fermentation outcomes."
         )
     else:
@@ -1103,8 +1103,8 @@ def _render_quark_ml_cards(df_run: "pd.DataFrame") -> None:
 
     c_ferm, c_sep = st.columns(2)
     for col, label, result in [
-        (c_ferm, "Fermentation Health",   ferm),
-        (c_sep,  "Separation Stability",  sep),
+        (c_ferm, "Fermentation Early Warning (ML)",  ferm),
+        (c_sep,  "Separation Early Warning (ML)",   sep),
     ]:
         with col:
             with st.container(border=True):
@@ -1122,8 +1122,8 @@ def _render_quark_ml_cards(df_run: "pd.DataFrame") -> None:
                     )
 
     st.caption(
-        "Fermentation Health indicates upstream deviation during acidification.  "
-        "Separation Stability indicates downstream behaviour during centrifugation.  "
+        "Fermentation Early Warning (ML) indicates upstream deviation during acidification.  "
+        "Separation Early Warning (ML) indicates downstream behaviour during centrifugation.  "
         "Neither is a root-cause diagnosis — observational signals only."
     )
 
@@ -1283,11 +1283,11 @@ def _render_quark_trend(
 
     if is_ferm:
         cache_key   = f"ferm_trend_{run_id}"
-        chart_title = "Fermentation Health — Score Trend"
+        chart_title = "Fermentation Early Warning (ML) — Score Trend"
         trace_color = "#1565C0"
         fill_color  = "rgba(21,101,192,0.08)"
         note        = (
-            "Fermentation Health score uses pH and temperature from fermentation steps only. "
+            "Fermentation Early Warning (ML) score uses pH and temperature from fermentation steps only. "
             "Elevated score indicates pH trajectory or temperature outside normal bounds."
         )
         if cache_key not in st.session_state:
@@ -1302,11 +1302,11 @@ def _render_quark_trend(
             st.session_state[cache_key] = (t_all, s_all)
     else:
         cache_key   = f"sep_trend_{run_id}"
-        chart_title = "Separation Stability — Score Trend"
+        chart_title = "Separation Early Warning (ML) — Score Trend"
         trace_color = "#6A1B9A"
         fill_color  = "rgba(106,27,154,0.08)"
         note        = (
-            "Separation Stability score uses centrifuge speed and ΔP from steady-state "
+            "Separation Early Warning (ML) score uses centrifuge speed and ΔP from steady-state "
             "separation rows only (speed > 1 000 rpm). "
             "Elevated score indicates pressure or speed instability during separation."
         )
@@ -2371,32 +2371,22 @@ def _render_right_panel(
                 f_stab = _anomaly_to_stability(ferm[0]) if ferm else 100
                 s_stab = _anomaly_to_stability(sep[0])  if sep  else 100
                 o1.metric(
-                    "Ferm. Stability",
+                    "Fermentation Stability (0–100)",
                     f"{f_stab} / 100",
-                    help=(
-                        "Fermentation stability: compares fermentation pH behaviour "
-                        "vs stable runs (upstream). 100 = fully stable."
-                    ),
+                    help="Derived from the Fermentation Early Warning (ML) score, normalised for reporting.",
                 )
                 o2.metric(
-                    "Sep. Stability",
+                    "Separation Stability (0–100)",
                     f"{s_stab} / 100",
-                    help=(
-                        "Separation stability: compares separation signals vs stable "
-                        "runs (downstream). An elevated score here is not a "
-                        "fermentation root cause."
-                    ),
+                    help="Derived from the Separation Early Warning (ML) score, normalised for reporting.",
                 )
                 st.caption("ML status details are shown in the Early Warning section below.")
             else:
                 stab, _, _ = _compute_run_stability(df_run, product)
                 o1.metric(
-                    "Run Stability Score",
+                    "Run Stability Score (0–100)",
                     f"{stab} / 100",
-                    help=(
-                        "Run stability: how closely this run's heating and holding "
-                        "patterns match stable runs. 100 = fully stable."
-                    ),
+                    help="Derived from the ML early warning score, normalised for reporting.",
                 )
             o2.metric("Extra CIP", "Yes" if run_row["extra_cleaning"] else "No")
         else:
