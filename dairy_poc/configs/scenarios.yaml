@@ -1,0 +1,622 @@
+# =============================================================================
+# Dairy PoC — Scenario & Schema Configuration
+# Products: QUARK (fermented fresh cheese), HIGH_PROTEIN_PUDDING
+# Default sampling: 1 minute
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# GLOBAL DEFAULTS
+# -----------------------------------------------------------------------------
+defaults:
+  sampling_freq_min: 1          # minutes between time-series rows
+  random_seed: 42
+
+
+# =============================================================================
+# PRODUCTS
+# =============================================================================
+products:
+
+  # ---------------------------------------------------------------------------
+  # QUARK
+  # Fermented fresh cheese; mesophilic lactic-acid bacteria culture.
+  # Total run: 12–15 h typical.
+  # ---------------------------------------------------------------------------
+  QUARK:
+    total_duration_hr: [12, 15]
+
+    process_steps:
+      inoculation_mixing:
+        order: 1
+        duration_min: [10, 30]
+        description: >
+          Starter culture added to pre-tempered milk; gentle agitation to distribute
+          inoculum evenly. Rennet addition event occurs here or in early_fermentation.
+        sensors:
+          temperature_C:   { nominal: 24,  noise_sd: 0.3,  unit: "°C",      range: [22, 26]  }
+          pressure_bar:    { nominal: 1.2,  noise_sd: 0.03, unit: "bar",     range: [1.0, 1.5] }
+          flow_rate_lpm:   { nominal: 80,   noise_sd: 2.0,  unit: "L/min",   range: [60, 120] }
+          shear_rpm:       { nominal: 120,  noise_sd: 5,    unit: "rpm",     range: [50, 200] }
+          pH:              { nominal: 6.6,  noise_sd: 0.02, unit: "—",       range: [6.4, 6.8] }
+          conductivity_mS: { nominal: 5.1,  noise_sd: 0.1,  unit: "mS/cm",  range: [4.5, 6.0], optional: true }
+
+      early_fermentation:
+        order: 2
+        duration_min: [120, 240]    # 2–4 h; rennet coagulation begins
+        description: >
+          Incubation at constant temperature; rennet causes coagulation.
+          pH begins to drop ~0.1–0.2 units. Minimal agitation (resting gel).
+        sensors:
+          temperature_C:   { nominal: 24,  noise_sd: 0.2,  unit: "°C",    range: [22, 26]  }
+          pressure_bar:    { nominal: 1.1,  noise_sd: 0.02, unit: "bar",   range: [1.0, 1.3] }
+          flow_rate_lpm:   { nominal: 0,    noise_sd: 0.5,  unit: "L/min", range: [0, 5]    }
+          shear_rpm:       { nominal: 0,    noise_sd: 1,    unit: "rpm",   range: [0, 10]   }
+          pH:              { nominal: 6.4,  noise_sd: 0.03, unit: "—",     range: [6.0, 6.7] }
+          conductivity_mS: { nominal: 5.0,  noise_sd: 0.1,  unit: "mS/cm",range: [4.5, 5.5], optional: true }
+        events:
+          rennet_addition:
+            occurs_at_pct: [0.05, 0.20]   # early in this step
+            description: "Rennet dose added; coagulation initiated"
+
+      late_fermentation:
+        order: 3
+        duration_min: [480, 720]    # 8–12 h; bulk of acidification
+        description: >
+          Undisturbed incubation; pH drops from ~6.2 to target 4.5–4.6.
+          Rate of pH drop is the primary process KPI here.
+        sensors:
+          temperature_C:   { nominal: 24,  noise_sd: 0.2,  unit: "°C",    range: [22, 26]  }
+          pressure_bar:    { nominal: 1.1,  noise_sd: 0.02, unit: "bar",   range: [1.0, 1.2] }
+          flow_rate_lpm:   { nominal: 0,    noise_sd: 0.3,  unit: "L/min", range: [0, 3]    }
+          shear_rpm:       { nominal: 0,    noise_sd: 1,    unit: "rpm",   range: [0, 5]    }
+          pH:              { nominal: 5.1,  noise_sd: 0.05, unit: "—",     range: [4.4, 6.5] }
+          conductivity_mS: { nominal: 4.8,  noise_sd: 0.15, unit: "mS/cm",range: [4.0, 5.5], optional: true }
+
+      gel_break_mixing:
+        order: 4
+        duration_min: [5, 25]
+        description: >
+          Slow agitation breaks the fermented curd into pumpable pieces before
+          centrifugation. Duration is recorded as gel_break_time_min (run-level).
+          Longer break times increase variance — not mean — of separation_deltaP
+          and widen the spread of yield_loss_pct and protein_pct post-standardization.
+        sensors:
+          temperature_C:   { nominal: 22,  noise_sd: 0.3,  unit: "°C",    range: [18, 26]  }
+          pressure_bar:    { nominal: 1.15, noise_sd: 0.03, unit: "bar",   range: [1.0, 1.4] }
+          flow_rate_lpm:   { nominal: 2,    noise_sd: 0.8,  unit: "L/min", range: [0, 8]    }
+          shear_rpm:       { nominal: 80,   noise_sd: 8,    unit: "rpm",   range: [30, 200] }
+          pH:              { nominal: 4.52, noise_sd: 0.03, unit: "—",     range: [4.3, 4.7] }
+        gel_break_effects:
+          separation_deltaP_noise_multiplier_per_5min: 0.12   # +12 % noise SD per 5 min above base
+          yield_loss_pct_spread_per_5min:              0.5    # +0.5 pp spread per 5 min above base
+          protein_pct_spread_post_std_per_5min:        0.08   # optional; spread only, not mean
+
+      separation:
+        order: 5
+        duration_min: [30, 90]
+        description: >
+          Centrifuge removes whey and concentrates the curd. Bowl accelerates
+          from 0 to setpoint over 3–8 min (startup ramp); normal steady-state
+          operation follows. Deceleration at end-of-run introduces a short burst
+          of elevated noise on separator_speed_rpm (shutdown transient).
+          separation_deltaP is the primary health signal for the centrifuge.
+        separation_type: centrifuge
+        sensors:
+          temperature_C:       { nominal: 20,   noise_sd: 0.4,  unit: "°C",  range: [15, 25]  }
+          pressure_bar:        { nominal: 2.8,  noise_sd: 0.08, unit: "bar", range: [2.0, 4.0] }
+          flow_rate_lpm:       { nominal: 60,   noise_sd: 3.0,  unit: "L/min",range: [30, 90]  }
+          shear_rpm:           { nominal: null, noise_sd: null, unit: "rpm", note: "null during separation; centrifuge uses separator_speed_rpm" }
+          separator_speed_rpm: { nominal: 6500, noise_sd: 30,   unit: "rpm", range: [5500, 7500],
+                                 startup_ramp_min: [3, 8],
+                                 shutdown_noise_sd_multiplier: 4.0 }
+          pH:                  { nominal: 4.55, noise_sd: 0.03, unit: "—",   range: [4.3, 4.8] }
+          separation_deltaP:   { nominal: 0.6,  noise_sd: 0.03, unit: "bar", range: [0.3, 1.5] }
+
+      standardization_mix:
+        order: 6
+        duration_min: [15, 45]
+        description: >
+          Mix pump blends concentrate with optional whey permeate or cream to hit
+          protein and fat targets. High-shear pump; protein variability highest here.
+        sensors:
+          temperature_C:   { nominal: 12,  noise_sd: 0.5,  unit: "°C",    range: [8, 18]   }
+          pressure_bar:    { nominal: 1.8,  noise_sd: 0.05, unit: "bar",   range: [1.2, 2.5] }
+          flow_rate_lpm:   { nominal: 55,   noise_sd: 3.0,  unit: "L/min", range: [30, 80]  }
+          shear_rpm:       { nominal: 800,  noise_sd: 20,   unit: "rpm",   range: [400, 1500]}
+          pH:              { nominal: 4.55, noise_sd: 0.04, unit: "—",     range: [4.3, 4.8] }
+
+      cooling:
+        order: 7
+        duration_min: [30, 60]
+        description: "Plate heat exchanger; product cooled to 4–8 °C for filling."
+        sensors:
+          temperature_C:   { nominal: 6,    noise_sd: 0.4,  unit: "°C",    range: [4, 10]   }
+          pressure_bar:    { nominal: 2.2,  noise_sd: 0.06, unit: "bar",   range: [1.5, 3.0] }
+          flow_rate_lpm:   { nominal: 50,   noise_sd: 2.0,  unit: "L/min", range: [30, 70]  }
+          shear_rpm:       { nominal: 0,    noise_sd: 0,    unit: "rpm",   range: [0, 0]    }
+          pH:              { nominal: 4.55, noise_sd: 0.03, unit: "—",     range: [4.3, 4.8] }
+
+      filling_packaging:
+        order: 8
+        duration_min: [30, 90]
+        description: "Aseptic or semi-aseptic filling; line speed sets fill rate."
+        sensors:
+          temperature_C:   { nominal: 6,    noise_sd: 0.5,  unit: "°C",    range: [4, 10]   }
+          pressure_bar:    { nominal: 1.6,  noise_sd: 0.05, unit: "bar",   range: [1.2, 2.0] }
+          flow_rate_lpm:   { nominal: 45,   noise_sd: 3.0,  unit: "L/min", range: [25, 65]  }
+          shear_rpm:       { nominal: 0,    noise_sd: 0,    unit: "rpm",   range: [0, 0]    }
+          pH:              { nominal: 4.55, noise_sd: 0.04, unit: "—",     range: [4.3, 4.8] }
+
+    # Spec limits — final product (run-level)
+    spec_limits:
+      protein_pct:            { lo: 10.0, hi: 14.0, unit: "%" }
+      total_solids_pct:       { lo: 18.0, hi: 23.0, unit: "%" }
+      fat_pct:                { lo: 0.05, hi: 0.5,  unit: "%" }          # Magerquark target
+      final_pH:               { lo: 4.4,  hi: 4.7,  unit: "—" }
+      fermentation_time_hr:   { lo: 10.0, hi: 16.0, unit: "h" }
+      viscosity_cP:           { lo: 4000, hi: 15000,unit: "cP" }
+      texture_score:          { lo: 60,   hi: 90,   unit: "0–100" }
+      whey_protein_loss_proxy: { lo: 0.0,  hi: 0.15, unit: "fraction", optional: true }
+
+    # Run-level fields recorded once per run (in runs.csv)
+    run_level_fields:
+      separator_speed_setpoint_rpm:
+        type: float
+        unit: "rpm"
+        range: [5500, 7500]
+        nominal: 6500
+        description: "Operator-entered centrifuge bowl speed setpoint for this run"
+
+      gel_break_time_min:
+        type: float
+        unit: "min"
+        range: [5, 25]
+        description: "Actual duration of gel_break_mixing step; drives variance in separation_deltaP and yield_loss_pct"
+
+      milk_tank_ids:
+        type: string
+        example: "T17+T22"
+        description: "IDs of milk storage tanks blended for this run"
+
+      blend_ratio:
+        type: string
+        example: "0.6/0.4"
+        description: "Fractional contribution of each tank in milk_tank_ids order"
+
+      raw_protein_pct:
+        type: float
+        unit: "%"
+        range: [2.8, 3.8]
+        optional: true
+        description: >
+          Raw milk protein content derived from blend composition.
+          Higher raw_protein_pct → faster fermentation rate (pH curve steeper)
+          and lower yield_loss_pct variance in Quark.
+
+      raw_solids_pct:
+        type: float
+        unit: "%"
+        range: [11.0, 13.5]
+        optional: true
+        description: "Raw milk total solids derived from blend; affects final total_solids_pct"
+
+  # ---------------------------------------------------------------------------
+  # HIGH_PROTEIN_PUDDING
+  # Heat-treated, starch-stabilised dessert. Total run: 2–4 h.
+  # ---------------------------------------------------------------------------
+  HIGH_PROTEIN_PUDDING:
+    total_duration_hr: [2, 4]
+
+    process_steps:
+      mixing:
+        order: 1
+        duration_min: [20, 40]
+        description: >
+          Dry ingredients (milk powder, protein concentrate, starch, sugar, stabilisers)
+          hydrated and blended into base liquid. Temperature rises during mixing.
+        sensors:
+          temperature_C:       { nominal: 45,  noise_sd: 1.0,  unit: "°C",    range: [20, 65]  }
+          pressure_bar:        { nominal: 1.4,  noise_sd: 0.04, unit: "bar",   range: [1.0, 2.0] }
+          flow_rate_lpm:       { nominal: 180,  noise_sd: 5.0,  unit: "L/min", range: [100, 250] }
+          shear_rpm:           { nominal: 350,  noise_sd: 15,   unit: "rpm",   range: [150, 600] }
+          pH:                  { nominal: 6.7,  noise_sd: 0.05, unit: "—",     range: [6.3, 7.0] }
+          viscosity_proxy:     { nominal: 500,  noise_sd: 30,   unit: "mPa·s", range: [200, 1200]}
+
+      heating:
+        order: 2
+        duration_min: [20, 40]
+        description: >
+          Indirect plate or tubular heat exchanger; product heated to 80–95 °C.
+          Fouling accumulates on hot surfaces during repeated runs.
+          deltaT_heat_exchanger is the primary fouling signal.
+        sensors:
+          temperature_C:         { nominal: 88,  noise_sd: 0.6,  unit: "°C",    range: [75, 98]  }
+          pressure_bar:          { nominal: 3.0,  noise_sd: 0.08, unit: "bar",   range: [2.0, 4.5] }
+          flow_rate_lpm:         { nominal: 160,  noise_sd: 4.0,  unit: "L/min", range: [80, 220] }
+          shear_rpm:             { nominal: 0,    noise_sd: 0,    unit: "rpm",   range: [0, 0]    }
+          pH:                    { nominal: 6.65, noise_sd: 0.05, unit: "—",     range: [6.2, 7.0] }
+          viscosity_proxy:       { nominal: 900,  noise_sd: 50,   unit: "mPa·s", range: [500, 2500]}
+          deltaT_heat_exchanger: { nominal: 12,   noise_sd: 0.5,  unit: "°C",    range: [5, 25],   optional: true }
+
+      holding:
+        order: 3
+        duration_min: [10, 30]
+        description: >
+          Tubular holding section at pasteurisation temperature.
+          Starch gelatinisation completes here; viscosity rises sharply.
+        sensors:
+          temperature_C:         { nominal: 88,  noise_sd: 0.4,  unit: "°C",    range: [82, 95]  }
+          pressure_bar:          { nominal: 2.8,  noise_sd: 0.06, unit: "bar",   range: [2.0, 4.0] }
+          flow_rate_lpm:         { nominal: 150,  noise_sd: 3.0,  unit: "L/min", range: [80, 200] }
+          shear_rpm:             { nominal: 0,    noise_sd: 0,    unit: "rpm",   range: [0, 0]    }
+          pH:                    { nominal: 6.65, noise_sd: 0.04, unit: "—",     range: [6.2, 7.0] }
+          viscosity_proxy:       { nominal: 2500, noise_sd: 150,  unit: "mPa·s", range: [1000, 6000]}
+          deltaT_heat_exchanger: { nominal: 8,    noise_sd: 0.5,  unit: "°C",    range: [3, 20],   optional: true }
+
+      cooling:
+        order: 4
+        duration_min: [30, 60]
+        description: >
+          Product cooled from ~88 °C to 10–18 °C on regenerative heat exchanger.
+          Viscosity continues to build as starch gel sets.
+        sensors:
+          temperature_C:         { nominal: 14,  noise_sd: 0.5,  unit: "°C",    range: [8, 22]   }
+          pressure_bar:          { nominal: 2.5,  noise_sd: 0.06, unit: "bar",   range: [1.8, 3.5] }
+          flow_rate_lpm:         { nominal: 140,  noise_sd: 4.0,  unit: "L/min", range: [80, 190] }
+          shear_rpm:             { nominal: 0,    noise_sd: 0,    unit: "rpm",   range: [0, 0]    }
+          pH:                    { nominal: 6.65, noise_sd: 0.04, unit: "—",     range: [6.2, 7.0] }
+          viscosity_proxy:       { nominal: 4500, noise_sd: 200,  unit: "mPa·s", range: [2000, 8000]}
+          deltaT_heat_exchanger: { nominal: 6,    noise_sd: 0.4,  unit: "°C",    range: [2, 15],   optional: true }
+
+      filling_packaging:
+        order: 5
+        duration_min: [30, 60]
+        optional: true
+        description: >
+          Hot-fill or warm-fill into cups/pots. Temperature at fill head
+          must stay above gel-point minimum (~12 °C) to flow correctly.
+        sensors:
+          temperature_C:   { nominal: 18,  noise_sd: 0.6,  unit: "°C",    range: [12, 25]  }
+          pressure_bar:    { nominal: 1.8,  noise_sd: 0.05, unit: "bar",   range: [1.2, 2.5] }
+          flow_rate_lpm:   { nominal: 120,  noise_sd: 4.0,  unit: "L/min", range: [70, 170] }
+          shear_rpm:       { nominal: 0,    noise_sd: 0,    unit: "rpm",   range: [0, 0]    }
+          pH:              { nominal: 6.65, noise_sd: 0.05, unit: "—",     range: [6.2, 7.0] }
+          viscosity_proxy: { nominal: 5000, noise_sd: 250,  unit: "mPa·s", range: [2500, 9000]}
+
+    # Spec limits — final product (run-level)
+    spec_limits:
+      protein_pct:         { lo: 8.0,  hi: 15.0, unit: "%" }
+      total_solids_pct:    { lo: 20.0, hi: 28.0, unit: "%" }
+      pH:                  { lo: 6.3,  hi: 7.0,  unit: "—" }
+      viscosity_cP:        { lo: 2000, hi: 8000, unit: "cP" }
+      texture_score:       { lo: 55,   hi: 85,   unit: "0–100" }
+      fouling_index_end:   { lo: 0.0,  hi: 0.35, unit: "0–1", optional: true }
+
+    # Run-level fields recorded once per run (in runs.csv)
+    run_level_fields:
+      milk_tank_ids:
+        type: string
+        example: "T03+T11"
+        description: "IDs of milk/base-liquid storage tanks blended for this run"
+
+      blend_ratio:
+        type: string
+        example: "0.7/0.3"
+        description: "Fractional contribution of each tank in milk_tank_ids order"
+
+      raw_protein_pct:
+        type: float
+        unit: "%"
+        range: [2.8, 3.8]
+        optional: true
+        description: >
+          Raw milk protein content derived from blend composition.
+          Slightly higher raw_protein_pct can increase viscosity_proxy baseline
+          and marginally raise fouling tendency during heating.
+
+      raw_solids_pct:
+        type: float
+        unit: "%"
+        range: [11.0, 13.5]
+        optional: true
+        description: "Raw milk total solids derived from blend; affects total_solids_pct of finished product"
+
+
+# =============================================================================
+# PRODUCTION SCALES
+# Noise multipliers and event probabilities scale with batch size / equipment age.
+# =============================================================================
+scales:
+  RD:
+    label: "R&D lab"
+    batch_size_L: [10, 50]
+    noise_multiplier: 2.0        # higher relative noise (small vessels, manual steps)
+    fault_probability_multiplier: 0.5   # operators catch issues quickly
+    description: "Bench-scale trials; high signal noise, close operator supervision"
+
+  TECHNIKUM:
+    label: "Technikum / Pilot"
+    batch_size_L: [100, 500]
+    noise_multiplier: 1.2
+    fault_probability_multiplier: 1.0   # baseline
+    description: "Pilot plant; representative of production but smaller scale"
+
+  PRODUCTION:
+    label: "Production"
+    batch_size_L: [1000, 10000]
+    noise_multiplier: 0.8        # better instrumentation, tighter control loops
+    fault_probability_multiplier: 1.5   # more runs → more cumulative fouling / wear
+    description: "Full-scale production line; longer CIP intervals, higher throughput"
+
+
+# =============================================================================
+# SCENARIOS
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared across both products
+# ---------------------------------------------------------------------------
+scenarios_common:
+
+  NORMAL:
+    description: "Clean run — all steps within nominal bounds; no injected faults"
+    probability: 0.50            # 50 % of generated runs
+    label_overrides: {}          # outcomes stay at defaults
+
+  DRIFT:
+    description: >
+      Gradual sensor or process drift across the run (e.g. thermocouple ageing,
+      pump wear). Signal mean shifts linearly; no step-change event.
+    probability: 0.15
+    drift_start_pct: 0.20        # drift begins 20 % into run
+    drift_end_pct:   1.00
+    affected_signals: [temperature_C, flow_rate_lpm]
+    drift_magnitude_sigma: 2.5   # final offset expressed in signal noise_sd units
+    label_overrides:
+      quality_deviation: 0        # usually caught before fill; no product impact
+      yield_loss_pct: [0, 2]
+
+  SENSOR_FAULT:
+    description: >
+      Instrument spike or flat-line (stuck sensor). Single sensor affected.
+      Represents thermocouple failure, transmitter saturation, or wiring fault.
+    probability: 0.10
+    fault_types: [spike, flatline]
+    n_events: [1, 5]
+    event_duration_min: [1, 10]  # spike = 1 min; flatline up to 10 min
+    label_overrides:
+      quality_deviation: 0
+      downtime_minutes: [0, 15]
+
+  RAW_MAT_VAR:
+    description: >
+      Incoming raw material outside specification — driven by milk tank blending
+      (blend_ratio or raw_protein_pct/raw_solids_pct outside normal range).
+      Shifts baseline sensor values from run start; effects are product-specific.
+    probability: 0.10
+    affected_attributes: [raw_protein_pct, raw_solids_pct, fat_pct, initial_pH]
+    shift_magnitude_sigma: 2.0
+    product_specific_effects:
+      QUARK:
+        fermentation_rate_multiplier: [0.7, 1.3]   # pH curve speed scales with raw_protein_pct
+        yield_loss_pct_spread_factor: 1.5           # wider yield spread vs. NORMAL
+      HIGH_PROTEIN_PUDDING:
+        viscosity_proxy_offset_mPas: [-120, +120]   # small baseline shift from blend protein
+        fouling_tendency_multiplier: [0.9, 1.2]     # marginal fouling effect; only relevant with FOUL
+    label_overrides:
+      quality_deviation: [0, 1]   # 50 % chance of quality deviation
+      yield_loss_pct: [0, 4]
+
+# ---------------------------------------------------------------------------
+# Pudding-specific
+# ---------------------------------------------------------------------------
+scenarios_pudding:
+
+  FOUL:
+    description: >
+      Progressive heat-exchanger fouling over heating and holding steps.
+      Protein and starch deposits build on hot plates; thermal resistance rises.
+      outlet_temp drifts down, pressure rises, deltaT_heat_exchanger grows.
+    probability: 0.08
+    affected_steps: [heating, holding]
+    fouling_onset_pct: 0.25      # fouling starts 25 % into affected steps
+    fouling_end_pct: 1.00
+    signal_effects:
+      temperature_C:         { drift: -4.0 }  # outlet drops
+      pressure_bar:          { drift: +0.8 }
+      deltaT_heat_exchanger: { drift: +8.0 }
+      flow_rate_lpm:         { drift: -15.0 }
+    label_overrides:
+      fouling_grade: [1, 3]
+      extra_cleaning: 1
+      quality_deviation: [0, 1]
+      downtime_minutes: [20, 90]
+      yield_loss_pct: [1, 5]
+
+  BLOCK:
+    description: >
+      Partial flow restriction in heating or cooling section — viscous plug,
+      valve fault, or gasket failure. Sudden flow drop; upstream pressure spike.
+    probability: 0.07
+    affected_steps: [heating, cooling]
+    onset_pct: 0.45
+    duration_min: [5, 25]
+    signal_effects:
+      flow_rate_lpm:  { step_change: -0.55 }   # 55 % sudden reduction
+      pressure_bar:   { step_change: +0.9 }
+    label_overrides:
+      fouling_grade: [0, 1]
+      extra_cleaning: [0, 1]
+      quality_deviation: 1
+      downtime_minutes: [15, 60]
+      yield_loss_pct: [2, 8]
+
+# ---------------------------------------------------------------------------
+# Quark-specific
+# ---------------------------------------------------------------------------
+scenarios_quark:
+
+  SLOW_FERMENT:
+    description: >
+      pH drop rate lower than expected during late_fermentation — culture
+      under-performing (e.g. phage stress, cold milk, low inoculation rate).
+      Fermentation time extends beyond schedule; run may be borderline for shift.
+    probability: 0.08
+    affected_steps: [late_fermentation]
+    signal_effects:
+      pH:
+        rate_multiplier: 0.55    # pH drops at 55 % of normal rate
+    label_overrides:
+      fermentation_time_hr: [14, 18]
+      quality_deviation: [0, 1]
+      yield_loss_pct: [0, 2]
+      downtime_minutes: [30, 120]
+
+  STALL_FERMENT:
+    description: >
+      pH plateaus mid-fermentation and ceases to drop — severe culture inhibition
+      or bacteriophage attack. Run likely scrapped.
+    probability: 0.04
+    affected_steps: [late_fermentation]
+    stall_onset_pct: 0.35        # stall begins 35 % into late_fermentation
+    signal_effects:
+      pH:
+        rate_multiplier: 0.0     # flat line after stall onset
+    label_overrides:
+      fermentation_time_hr: [99]  # sentinel: run did not complete normally
+      quality_deviation: 1
+      yield_loss_pct: [80, 100]
+      downtime_minutes: [60, 240]
+
+  OVER_ACID:
+    description: >
+      Fermentation overshoots target pH — culture too active, temperature
+      too high, or incubation ran long. Final pH < 4.3; texture crumbly;
+      protein denaturation possible.
+    probability: 0.05
+    affected_steps: [late_fermentation]
+    signal_effects:
+      pH:
+        rate_multiplier: 1.35    # faster acidification
+        floor: 4.1               # pH allowed to drop below normal target
+    label_overrides:
+      final_pH: [4.1, 4.35]
+      quality_deviation: 1
+      yield_loss_pct: [5, 20]
+      texture_score: [30, 55]
+
+  SEPARATION_ISSUE:
+    description: >
+      Centrifuge separation efficiency drops — bowl imbalance, worn nozzles/seals,
+      or feed too viscous after an over-extended gel break. Whey not adequately
+      removed; protein target missed; separation_deltaP elevated; flow reduced.
+    probability: 0.06
+    affected_steps: [separation]
+    signal_effects:
+      separation_deltaP: { drift: +0.5 }
+      flow_rate_lpm:     { drift: -25.0 }
+    label_overrides:
+      whey_protein_loss_proxy: [0.15, 0.40]
+      protein_pct: [8.0, 10.5]   # under-concentrated
+      fouling_grade: [0, 1]
+      quality_deviation: 1
+      yield_loss_pct: [5, 15]
+      downtime_minutes: [20, 60]
+
+  STANDARDIZATION_OFFTARGET:
+    description: >
+      Mix pump dosing error or incorrect setpoint; protein/fat target missed.
+      High run-to-run variability in final product composition.
+    probability: 0.07
+    affected_steps: [standardization_mix]
+    signal_effects:
+      flow_rate_lpm: { noise_multiplier: 3.0 }
+      shear_rpm:     { noise_multiplier: 2.5 }
+    label_overrides:
+      protein_pct: [8.5, 16.0]   # wide spread either side of target
+      quality_deviation: [0, 1]
+      yield_loss_pct: [0, 5]
+
+
+# =============================================================================
+# OUTCOMES / RUN LABELS  (one value per run row in runs.csv)
+# =============================================================================
+outcomes:
+  quality_deviation:
+    type: binary            # 0 = pass, 1 = deviation recorded
+    default: 0
+
+  yield_loss_pct:
+    type: continuous
+    unit: "%"
+    default: 0.0
+    range: [0, 100]
+
+  downtime_minutes:
+    type: continuous
+    unit: "min"
+    default: 0
+    range: [0, 480]
+
+  fouling_grade:
+    type: ordinal
+    levels: [0, 1, 2, 3]
+    description: "0=clean, 1=light, 2=moderate, 3=heavy — triggers CIP"
+    default: 0
+    primary_product: HIGH_PROTEIN_PUDDING
+    secondary_product: QUARK   # separation fouling only
+
+  extra_cleaning:
+    type: binary            # 0 = scheduled CIP only, 1 = unplanned CIP added
+    default: 0
+
+
+# =============================================================================
+# EVENTS  (rows in events.csv; multiple per run)
+# =============================================================================
+events:
+  inoculation:
+    applies_to: [QUARK]
+    step: inoculation_mixing
+    description: "Starter culture dosed into vessel"
+
+  rennet_addition:
+    applies_to: [QUARK]
+    step: early_fermentation
+    description: "Rennet added; coagulation clock starts"
+
+  gel_break_start:
+    applies_to: [QUARK]
+    step: gel_break_mixing
+    description: "Agitator started; gel break begins"
+
+  separation_start:
+    applies_to: [QUARK]
+    step: separation
+    description: "Centrifuge bowl started; speed ramp begins"
+
+  standardization_start:
+    applies_to: [QUARK]
+    step: standardization_mix
+    description: "Mix pump activated; blending begins"
+
+  filling_start:
+    applies_to: [QUARK, HIGH_PROTEIN_PUDDING]
+    step: filling_packaging
+    description: "Filling line cleared; production fill begins"
+
+  CIP:
+    applies_to: [QUARK, HIGH_PROTEIN_PUDDING]
+    step: any
+    description: "Clean-in-Place cycle; run paused"
+    triggers: [fouling_grade >= 2, extra_cleaning == 1, scheduled]
+
+  maintenance:
+    applies_to: [QUARK, HIGH_PROTEIN_PUDDING]
+    step: any
+    description: "Unplanned maintenance stop (pump seal, sensor replacement, etc.)"
+
+  changeover:
+    applies_to: [QUARK, HIGH_PROTEIN_PUDDING]
+    step: any
+    description: "Product or format changeover between runs"
