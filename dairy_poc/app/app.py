@@ -963,59 +963,61 @@ def _render_divergence_panel(
     x_range:       tuple[float, float] | None,  # kept for call-site compat; not used
     selected_step: str,
 ) -> None:
-    """Step-anchored divergence narrative.
+    """Step-anchored divergence narrative across all process steps.
 
-    Scans steps chronologically to find where the run first diverges from the
-    NORMAL reference, then describes subsequent divergent steps as downstream
-    observations — not as causes.
+    Every step is shown in chronological order with a status icon:
+      ⭐  first step where divergence is detected
+      ⚠️  subsequent divergent step (downstream)
+      ✅  no divergence detected in this step
     """
-    signals     = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+    signals      = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
     step_results = _analyze_step_divergence(df_run, df_baseline, signals)
     if not step_results:
         return
 
     st.subheader("Where this run diverges from reference (and what happens next)")
 
-    first_div = next((sr for sr in step_results if sr["diverges"]), None)
-
-    if first_div is None:
-        with st.container(border=True):
-            st.caption("No significant divergence from the NORMAL reference detected across all steps.")
-        return
-
-    first_step = first_div["step"]
+    first_div  = next((sr for sr in step_results if sr["diverges"]), None)
+    first_step = first_div["step"] if first_div else None
 
     with st.container(border=True):
-        step_label = first_step.replace("_", " ").capitalize()
-        st.markdown(f"**First detectable divergence:** *{step_label}*")
-        st.divider()
+        if first_step is None:
+            st.caption(
+                "No significant divergence from the NORMAL reference detected across all steps."
+            )
+            return
 
         for sr in step_results:
-            if not sr["diverges"]:
-                continue
+            is_first_div = (sr["step"] == first_step)
+            is_zoomed    = (selected_step == sr["step"])
+            sl           = sr["step"].replace("_", " ").capitalize()
 
-            is_first  = (sr["step"] == first_step)
-            is_zoomed = (selected_step == sr["step"])
-            sl        = sr["step"].replace("_", " ").capitalize()
-
-            header = f"**{sl}**"
-            if is_zoomed:
-                header += " _(currently zoomed)_"
-            if not is_first:
-                header += " _(downstream)_"
-            st.markdown(header)
-
-            bullets = _step_bullets(sr["step"], product, sr["sigs"], is_first, first_step)
-            if bullets:
-                for b in bullets:
-                    st.markdown(f"  - {b}")
+            if is_first_div:
+                icon = "⭐"           # ⭐  first divergence
+            elif sr["diverges"]:
+                icon = "⚠️"     # ⚠️  downstream divergence
             else:
-                for sig in [s for s in sr["sigs"] if s["diverges"]][:2]:
-                    dr = "above" if sig["mean_diff"] > 0 else "below"
-                    st.markdown(
-                        f"  - {sig['label']} differs from reference "
-                        f"({sig['mean_diff']:+.3g} {sig['unit']})."
-                    )
+                icon = "✅"           # ✅  stable
+
+            zoomed_tag = " *(zoomed)*" if is_zoomed else ""
+            st.markdown(f"{icon} **{sl}**{zoomed_tag}")
+
+            if not sr["diverges"]:
+                st.markdown("  - Signals stable vs reference.")
+            else:
+                bullets = _step_bullets(
+                    sr["step"], product, sr["sigs"], is_first_div, first_step,
+                )
+                if bullets:
+                    for b in bullets:
+                        st.markdown(f"  - {b}")
+                else:
+                    for sig in [s for s in sr["sigs"] if s["diverges"]][:2]:
+                        dr = "above" if sig["mean_diff"] > 0 else "below"
+                        st.markdown(
+                            f"  - {sig['label']} differs from reference "
+                            f"({sig['mean_diff']:+.3g} {sig['unit']})."
+                        )
 
         st.divider()
         st.caption(
