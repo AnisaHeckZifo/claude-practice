@@ -102,6 +102,23 @@ _EVENT_SHORT: dict[str, str] = {
 }
 
 
+def _find_baseline_run_id(
+    runs:    pd.DataFrame,
+    product: str,
+    scale:   str,
+) -> str | None:
+    """Return the run_id of a NORMAL run for the same product.
+
+    Prefers the same scale; falls back to any NORMAL run for the product.
+    """
+    normals = runs[(runs["product"] == product) & (runs["scenario"] == "NORMAL")]
+    if normals.empty:
+        return None
+    same_scale = normals[normals["scale"] == scale]
+    pool = same_scale if not same_scale.empty else normals
+    return str(pool.iloc[0]["run_id"])
+
+
 def _compute_step_windows(
     run_ts: pd.DataFrame,
 ) -> list[tuple[str, float, float]]:
@@ -166,25 +183,46 @@ def _add_event_markers(
 
 
 def _make_signal_chart(
-    df_run:     pd.DataFrame,
-    col:        str,
-    label:      str,
-    unit:       str,
-    color:      str,
-    show_xaxis: bool = False,
-    evts:       pd.DataFrame | None = None,
-    x_range:    tuple[float, float] | None = None,
+    df_run:      pd.DataFrame,
+    col:         str,
+    label:       str,
+    unit:        str,
+    color:       str,
+    show_xaxis:  bool = False,
+    evts:        pd.DataFrame | None = None,
+    x_range:     tuple[float, float] | None = None,
+    df_baseline: pd.DataFrame | None = None,
 ) -> go.Figure:
     """Return a single compact Plotly line chart for one sensor signal."""
+    has_baseline = (
+        df_baseline is not None
+        and col in df_baseline.columns
+        and not df_baseline[col].isna().all()
+    )
+
     fig = go.Figure()
+
+    # Baseline drawn first so it sits visually behind the selected run
+    if has_baseline:
+        fig.add_trace(go.Scatter(
+            x=df_baseline["t_min"],
+            y=df_baseline[col],
+            mode="lines",
+            line=dict(color=color, width=1.4, dash="dash"),
+            opacity=0.45,
+            name="Baseline (NORMAL)",
+            connectgaps=False,
+        ))
+
     fig.add_trace(go.Scatter(
         x=df_run["t_min"],
         y=df_run[col],
         mode="lines",
         line=dict(color=color, width=1.8),
-        name=label,
-        connectgaps=False,      # NaN → visible gap in the line
+        name="Selected run",
+        connectgaps=False,
     ))
+
     fig.update_layout(
         height=185,
         margin=dict(l=8, r=8, t=6, b=36 if show_xaxis else 6),
@@ -201,7 +239,18 @@ def _make_signal_chart(
             gridcolor="#ebebeb",
             zeroline=False,
         ),
-        showlegend=False,
+        showlegend=has_baseline,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0,
+            font=dict(size=9),
+            bgcolor="rgba(255,255,255,0.75)",
+            bordercolor="#dddddd",
+            borderwidth=1,
+        ),
         plot_bgcolor="white",
         paper_bgcolor="white",
     )
@@ -216,6 +265,8 @@ def render_signal_charts(
     df_run:   pd.DataFrame,
     product:  str,
     run_evts: pd.DataFrame,
+    runs:     pd.DataFrame,
+    ts:       pd.DataFrame,
 ) -> None:
     """Render one Plotly line chart per signal, stacked vertically."""
     signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
@@ -246,6 +297,22 @@ def render_signal_charts(
         label_visibility="collapsed",
     )
 
+    # ── Baseline toggle ────────────────────────────────────────────────────────
+    show_baseline = st.checkbox(
+        "Compare to baseline (NORMAL)",
+        key=f"baseline_{run_id_key}",
+    )
+
+    df_baseline: pd.DataFrame | None = None
+    if show_baseline:
+        run_meta = runs[runs["run_id"] == run_id_key]
+        scale    = str(run_meta["scale"].iloc[0]) if not run_meta.empty else "PRODUCTION"
+        baseline_run_id = _find_baseline_run_id(runs, product, scale)
+        if baseline_run_id:
+            df_baseline = ts[ts["run_id"] == baseline_run_id].copy()
+        else:
+            st.caption("No NORMAL baseline found for this product.")
+
     # ── X-range for selected step (1-min padding each side) ───────────────────
     if sel_step == "full_run":
         x_range: tuple[float, float] | None = None
@@ -264,7 +331,7 @@ def render_signal_charts(
             (evts_to_show["t_min"] <= x_range[1])
         ]
 
-    # ── Chart loop — same x_range applied to every panel ──────────────────────
+    # ── Chart loop — same x_range and baseline applied to every panel ─────────
     for i, (col, label, unit, color) in enumerate(renderable):
         is_last = (i == len(renderable) - 1)
         fig = _make_signal_chart(
@@ -272,6 +339,7 @@ def render_signal_charts(
             show_xaxis=is_last,
             evts=evts_to_show,
             x_range=x_range,
+            df_baseline=df_baseline,
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
@@ -409,7 +477,7 @@ def render_main(
     with col_main:
         _render_run_header(run_row, story)
         _render_timeline_placeholder(run_ts)
-        render_signal_charts(run_ts, run_row["product"], run_evts)
+        render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
         _render_right_panel(mode, run_row, lab_row, story)
