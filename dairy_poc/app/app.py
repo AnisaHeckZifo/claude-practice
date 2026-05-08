@@ -364,6 +364,34 @@ def render_signal_charts(
 
 _ML_WINDOW:        int   = 10    # rolling window for slope/std features (minutes)
 _ML_THRESHOLD_PCT: float = 95.0  # percentile of NORMAL scores used as alert level
+_ML_WATCH_THRESH:  float = 0.90  # run-level model score: Watch starts here (calibrated)
+_ML_HIGH_THRESH:   float = 1.00  # run-level model score: High = at/above 95th-pct NORMAL
+
+
+def _extract_run_summary(
+    run_ts:  pd.DataFrame,
+    signals: list[tuple[str, str, str, str]],
+) -> list[float]:
+    """One fixed-length feature vector per run: [mean, std, range, slope] per signal.
+
+    Used to train and score the run-level IsolationForest.
+    All four statistics are 0.0 when a signal has fewer than 3 valid rows.
+    """
+    feats: list[float] = []
+    for col, *_ in signals:
+        vals = run_ts[col].dropna() if col in run_ts.columns else pd.Series(dtype=float)
+        t    = run_ts.loc[vals.index, "t_min"].values.astype(float) if not vals.empty else np.array([])
+        v    = vals.values.astype(float)
+        if len(v) >= 3:
+            feats += [
+                float(v.mean()),
+                float(v.std()),
+                float(v.max() - v.min()),
+                float(np.polyfit(t, v, 1)[0]),
+            ]
+        else:
+            feats += [0.0, 0.0, 0.0, 0.0]
+    return feats
 
 
 def _extract_ml_features(
@@ -436,6 +464,26 @@ def _load_ml_models() -> dict:
         threshold     = float(np.percentile(normal_scores, _ML_THRESHOLD_PCT))
 
         models[product] = {"pipeline": pipe, "threshold": threshold}
+
+        # --- Run-level model: one summary vector per normal run ---
+        summaries = [
+            _extract_run_summary(ts_df[ts_df["run_id"] == rid], signals)
+            for rid in normal_ids
+        ]
+        if len(summaries) >= 5:
+            Xr = np.array(summaries, dtype=float)
+            run_pipe = Pipeline([
+                ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+                ("scaler",  StandardScaler()),
+                ("iso",     IsolationForest(
+                    n_estimators=100, contamination="auto", random_state=42,
+                )),
+            ])
+            run_pipe.fit(Xr)
+            run_scores  = (-run_pipe.score_samples(Xr)).clip(min=0)
+            run_thr     = float(np.percentile(run_scores, _ML_THRESHOLD_PCT))
+            models[product]["run_pipeline"]  = run_pipe
+            models[product]["run_threshold"] = run_thr
 
     return models
 
@@ -572,6 +620,121 @@ def _render_ml_warning(
         "Score > 1.0 = sensor pattern unusual vs reference behaviour.  "
         "Observational signal only — not a diagnosis."
     )
+
+
+def _compute_ml_run_score(
+    df_run:  pd.DataFrame,
+    product: str,
+) -> tuple[float, float] | None:
+    """Single normalised run-level anomaly score using per-run summary features.
+
+    The run-level IsolationForest is trained on [mean, std, range, slope] per signal
+    across the full run — one vector per normal run.  This avoids the aggregation
+    instability of per-row scores.
+
+    Returns (normalized_score, run_threshold).  Score >= 1.0 means the run profile
+    is as unusual as the 95th-pct normal run.
+    Returns None when sklearn is unavailable or the product has no run-level model.
+    """
+    if not _SKLEARN_AVAILABLE:
+        return None
+    models = _load_ml_models()
+    m = models.get(product)
+    if m is None or "run_pipeline" not in m:
+        return None
+    signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+    feats   = np.array([_extract_run_summary(df_run, signals)], dtype=float)
+    raw     = float((-m["run_pipeline"].score_samples(feats)).clip(min=0)[0])
+    norm    = raw / max(float(m["run_threshold"]), 1e-9)
+    return norm, float(m["run_threshold"])
+
+
+def _compute_ml_row_scores(
+    df_ts:   pd.DataFrame,
+    product: str,
+) -> np.ndarray | None:
+    """Per-row normalised scores from the row-level model.  Used for step drill-down.
+
+    Returns a numpy array aligned with df_ts rows, or None if unavailable.
+    """
+    if not _SKLEARN_AVAILABLE:
+        return None
+    models = _load_ml_models()
+    m = models.get(product)
+    if m is None:
+        return None
+    signals = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+    feat_df = _extract_ml_features(df_ts, signals)
+    X       = feat_df.values.astype(float)
+    raw     = (-m["pipeline"].score_samples(X)).clip(min=0)
+    return raw / max(float(m["threshold"]), 1e-9)
+
+
+def _render_ml_score_panel(
+    df_run:        pd.DataFrame,
+    product:       str,
+    x_range:       tuple[float, float] | None,
+    selected_step: str,
+    run_id:        str,
+) -> None:
+    """Always-visible ML Early Warning summary panel, rendered above signal charts.
+
+    Uses a run-level IsolationForest (per-run summary features) for the main score.
+    When a step is zoomed, also shows the mean row-level anomaly score for that step.
+    """
+    st.subheader("ML Early Warning")
+
+    if not _SKLEARN_AVAILABLE:
+        st.caption("scikit-learn not installed — ML early warning unavailable.")
+        return
+
+    if df_run.empty:
+        return
+
+    result = _compute_ml_run_score(df_run, product)
+    if result is None:
+        st.caption("ML model not available for this product.")
+        return
+
+    run_score, run_threshold = result
+
+    if run_score < _ML_WATCH_THRESH:
+        status    = "Normal"
+        flag_text = "✅ Normal"
+        show_flag = st.success
+    elif run_score < _ML_HIGH_THRESH:
+        status    = "Watch"
+        flag_text = "⚠️ Watch"
+        show_flag = st.warning
+    else:
+        status    = "High"
+        flag_text = "🚨 High Risk"
+        show_flag = st.error
+
+    with st.container(border=True):
+        c1, c2 = st.columns(2)
+        c1.metric("Anomaly score", f"{run_score:.2f}")
+        c2.metric("Status",        status)
+        show_flag(flag_text)
+        st.caption(
+            f"Threshold (Watch): {_ML_WATCH_THRESH:.2f}  ·  "
+            f"Threshold (High Risk): {_ML_HIGH_THRESH:.2f}  ·  "
+            f"Training alert level (95th-pct NORMAL): {run_threshold:.4f}  ·  "
+            f"Level 1 indicative signal — not a definitive alarm"
+        )
+
+        # Step-level score: mean row-level anomaly score for the zoomed step
+        if selected_step != "full_run" and "step" in df_run.columns:
+            row_scores = _compute_ml_row_scores(df_run, product)
+            if row_scores is not None:
+                step_mask = df_run["step"].values == selected_step
+                if step_mask.any():
+                    step_score = float(row_scores[step_mask].mean())
+                    step_label = selected_step.replace("_", " ").capitalize()
+                    st.caption(
+                        f"Selected step score ({step_label}): {step_score:.2f}"
+                        f"  (mean row-level score)"
+                    )
 
 
 # =============================================================================
@@ -783,6 +946,7 @@ def render_main(
     with col_main:
         _render_run_header(run_row, story)
         _render_process_timeline(run_ts, run_evts, selected_step)
+        _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
