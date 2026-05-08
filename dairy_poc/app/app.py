@@ -1505,7 +1505,6 @@ def _compute_similar_runs(
             "downtime_minutes": float(run_meta["downtime_minutes"]),
             "yield_loss_pct":   float(run_meta["yield_loss_pct"]),
             "extra_cleaning":   bool(run_meta["extra_cleaning"]),
-            "fouling_grade":    str(run_meta["fouling_grade"]),
         })
 
     results.sort(key=lambda x: x["similarity"], reverse=True)
@@ -2404,18 +2403,21 @@ def _render_right_panel(
                     st.markdown(f"- {bullet}")
 
 
-def _render_lab_metrics(lab_row: pd.Series, product: str) -> None:
-    """Show the most relevant lab values as compact metrics."""
-    st.metric("Protein",      f"{lab_row['protein_pct']:.2f} %")
-    st.metric("Total solids", f"{lab_row['total_solids_pct']:.2f} %")
-    st.metric("Viscosity",    f"{lab_row['viscosity_value']:.0f} cP")
-    st.metric("pH (offline)", f"{lab_row['final_pH_offline']:.3f}")
-    st.metric("D50 particle", f"{lab_row['d50_um']:.1f} µm")
+def _render_lab_metrics(lab_row: pd.Series, product: str) -> None:  # noqa: ARG001
+    """Show the 5 core lab QC fields — identical layout for both products."""
+    _NA = "Not available in this PoC"
 
-    if product == "QUARK":
-        ferm = lab_row.get("fermentation_time_hr")
-        if ferm is not None and pd.notna(ferm):
-            st.metric("Ferm. time", "DNF" if ferm == 99.0 else f"{ferm:.1f} h")
+    def _fmt(col: str, fmt: str) -> str:
+        v = lab_row.get(col)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return _NA
+        return fmt.format(v)
+
+    st.metric("Protein",                     _fmt("protein_pct",      "{:.2f} %"))
+    st.metric("Total solids",                _fmt("total_solids_pct", "{:.2f} %"))
+    st.metric("Viscosity",                   _fmt("viscosity_value",  "{:.0f} cP"))
+    st.metric("pH (offline)",                _fmt("final_pH_offline", "{:.3f}"))
+    st.metric("D50 (laser diffraction, µm)", _fmt("d50_um",           "{:.1f}"))
 
 
 # =============================================================================
