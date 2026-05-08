@@ -15,6 +15,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+try:
+    import sklearn  # noqa: F401
+    _SKLEARN_AVAILABLE = True
+except ImportError:
+    _SKLEARN_AVAILABLE = False
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).parents[1]
 _RAW  = _ROOT / "data_raw"
@@ -350,6 +356,222 @@ def render_signal_charts(
             df_baseline=df_baseline,
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+# =============================================================================
+# ML EARLY WARNING  (IsolationForest, trained on NORMAL runs at startup)
+# =============================================================================
+
+_ML_WINDOW:        int   = 10    # rolling window for slope/std features (minutes)
+_ML_THRESHOLD_PCT: float = 95.0  # percentile of NORMAL scores used as alert level
+
+
+def _extract_ml_features(
+    df_ts:   pd.DataFrame,
+    signals: list[tuple[str, str, str, str]],
+    window:  int = _ML_WINDOW,
+) -> pd.DataFrame:
+    """Raw value + rolling slope + rolling std per signal.
+
+    Slope is approximated as (y[t] − y[t−window+1]) / (window−1), which is
+    O(n) vectorised and sufficient for anomaly detection.  NaN values (signals
+    inactive in the current step) are left as NaN and imputed by the pipeline.
+    """
+    cols: dict = {}
+    for col, *_ in signals:
+        if col not in df_ts.columns:
+            continue
+        s = df_ts[col]
+        cols[col]            = s
+        cols[f"{col}_slope"] = (s - s.shift(window - 1)) / (window - 1)
+        cols[f"{col}_rstd"]  = s.rolling(window, min_periods=2).std()
+    return pd.DataFrame(cols, index=df_ts.index)
+
+
+@st.cache_resource
+def _load_ml_models() -> dict:
+    """Train one IsolationForest per product on all NORMAL runs.
+
+    Uses @st.cache_resource so training runs once per app-server start.
+    Restart the app to pick up new training data.
+    Returns {} when scikit-learn is unavailable or data is insufficient.
+    """
+    if not _SKLEARN_AVAILABLE:
+        return {}
+
+    from sklearn.ensemble import IsolationForest
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    runs_df = pd.read_csv(_RAW / "runs.csv")
+    ts_df   = pd.read_csv(_RAW / "timeseries.csv")
+
+    models: dict = {}
+    for product, signals in [
+        ("QUARK",                _QUARK_SIGNALS),
+        ("HIGH_PROTEIN_PUDDING", _PUDDING_SIGNALS),
+    ]:
+        normal_ids = runs_df.loc[
+            (runs_df["product"] == product) & (runs_df["scenario"] == "NORMAL"), "run_id"
+        ]
+        normal_ts = ts_df[ts_df["run_id"].isin(normal_ids)]
+        if normal_ts.empty:
+            continue
+
+        feat_df = _extract_ml_features(normal_ts, signals)
+        X       = feat_df.values.astype(float)
+
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler",  StandardScaler()),
+            ("iso",     IsolationForest(
+                n_estimators=100, contamination="auto", random_state=42,
+            )),
+        ])
+        pipe.fit(X)
+
+        # Alert threshold = Nth-percentile anomaly score on the training data
+        normal_scores = (-pipe.score_samples(X)).clip(min=0)
+        threshold     = float(np.percentile(normal_scores, _ML_THRESHOLD_PCT))
+
+        models[product] = {"pipeline": pipe, "threshold": threshold}
+
+    return models
+
+
+def _render_ml_warning(
+    df_run:        pd.DataFrame,
+    product:       str,
+    x_range:       tuple[float, float] | None,
+    selected_step: str,
+    run_id:        str,
+) -> None:
+    """Toggle-gated anomaly score chart with first-exceedance marker.
+
+    Scores the full run for proper rolling context, then clips the display to
+    the current zoom window.  Does not imply causality.
+    """
+    show = st.checkbox(
+        "Show ML-assisted early warning",
+        key=f"ml_warning_{run_id}",
+    )
+    if not show:
+        return
+
+    if not _SKLEARN_AVAILABLE:
+        st.warning(
+            "scikit-learn is required for ML early warning.  "
+            "Install it with:  "
+            "`uv pip install scikit-learn --python .venv/Scripts/python.exe`"
+        )
+        return
+
+    if df_run.empty:
+        return
+
+    models = _load_ml_models()
+    if product not in models:
+        st.caption("ML model not available for this product.")
+        return
+
+    m         = models[product]
+    pipe      = m["pipeline"]
+    threshold = m["threshold"]
+    signals   = _QUARK_SIGNALS if product == "QUARK" else _PUDDING_SIGNALS
+
+    # Score the full run (preserves rolling context at step boundaries)
+    feat_df     = _extract_ml_features(df_run, signals)
+    X           = feat_df.values.astype(float)
+    raw_scores  = (-pipe.score_samples(X)).clip(min=0)
+    # Normalise so the alert threshold sits at y = 1.0
+    norm_scores = raw_scores / max(threshold, 1e-9)
+    t_arr       = df_run["t_min"].values
+
+    # Clip display to the current zoom window
+    if x_range is not None:
+        lo, hi = x_range
+        mask = (t_arr >= lo) & (t_arr <= hi)
+    else:
+        mask = np.ones(len(t_arr), dtype=bool)
+
+    t_vis     = t_arr[mask]
+    score_vis = norm_scores[mask]
+    if len(t_vis) == 0:
+        return
+
+    # First timepoint in the visible window where score exceeds the threshold
+    exceed          = score_vis > 1.0
+    first_t: float | None = float(t_vis[exceed][0]) if exceed.any() else None
+    first_step_lbl: str | None = None
+    if first_t is not None:
+        sr = df_run[(df_run["t_min"] - first_t).abs() < 0.5]
+        if not sr.empty:
+            first_step_lbl = sr["step"].iloc[0].replace("_", " ")
+
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    st.subheader("ML-assisted early warning")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=t_vis, y=score_vis,
+        mode="lines",
+        line=dict(color="#FF9800", width=1.5),
+        fill="tozeroy",
+        fillcolor="rgba(255,152,0,0.08)",
+        hovertemplate="t = %{x:.1f} min<br>Score = %{y:.2f}× threshold<extra></extra>",
+        showlegend=False,
+    ))
+    fig.add_hline(
+        y=1.0,
+        line_dash="dash", line_color="#E53935", line_width=1.5,
+        annotation_text="Alert threshold",
+        annotation_position="top right",
+        annotation_font_size=9, annotation_font_color="#E53935",
+    )
+    if first_t is not None:
+        fig.add_vline(
+            x=first_t, line_dash="dot", line_color="#E53935", line_width=1.5,
+        )
+        fig.add_annotation(
+            x=first_t,
+            y=max(float(score_vis.max()), 1.15),
+            text=f"t = {first_t:.0f}",
+            showarrow=False,
+            font=dict(size=9, color="#E53935"),
+            xanchor="left",
+        )
+    fig.update_layout(
+        height=135,
+        margin=dict(l=8, r=8, t=4, b=36),
+        xaxis=dict(title="t (min)", showgrid=True, gridcolor="#ebebeb", zeroline=False),
+        yaxis=dict(
+            title="Score (× threshold)",
+            showgrid=True, gridcolor="#ebebeb", zeroline=False,
+            range=[0, max(float(score_vis.max()) * 1.1, 1.5)],
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    # ── Explanatory text ──────────────────────────────────────────────────────
+    if first_t is not None:
+        step_clause = f" (step: *{first_step_lbl}*)" if first_step_lbl else ""
+        st.warning(
+            f"ML-assisted early warning: unusual pattern begins around "
+            f"**t = {first_t:.0f} min**{step_clause}.  "
+            f"This does not imply a root cause — it indicates the sensor-signal "
+            f"combination is unusual relative to NORMAL runs."
+        )
+    else:
+        st.success("No anomaly detected above the alert threshold in this window.")
+
+    st.caption(
+        "Model: IsolationForest trained on NORMAL runs only (one model per product).  "
+        "Score > 1.0 = sensor pattern unusual vs reference behaviour.  "
+        "Observational signal only — not a diagnosis."
+    )
 
 
 # =============================================================================
