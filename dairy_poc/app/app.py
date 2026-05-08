@@ -680,6 +680,48 @@ def _score_status(score: float) -> tuple[str, str]:
 _STATUS_FN = {"Normal": st.success, "Watch": st.warning, "High": st.error}
 
 
+def _anomaly_to_stability(score: float) -> int:
+    """Convert a normalised ML anomaly score to a 0–100 Run Stability Score.
+
+    Mapping (anchored to model thresholds):
+      score ≤ Watch (0.90) → stability = 100  (pattern within normal band)
+      score = 0.95 (mid Watch–High) → stability ≈ 50
+      score ≥ High (1.00) → stability = 0     (strong anomaly pattern)
+    Linear between Watch and High; clamped outside that range.
+    """
+    band = _ML_HIGH_THRESH - _ML_WATCH_THRESH  # = 0.10
+    normalised_risk = max(0.0, min(1.0, (score - _ML_WATCH_THRESH) / band))
+    return round(100 - 100 * normalised_risk)
+
+
+def _compute_run_stability(
+    df_run:  pd.DataFrame,
+    product: str,
+) -> tuple[int, str, str]:
+    """(stability_0_100, status, badge) for a run, using ML Early Warning scores.
+
+    QUARK: average of Fermentation Health and Separation Stability scores.
+           Averaging avoids one sub-system's false positives dominating the summary.
+    PUDDING: single run-level anomaly score.
+    Returns (100, 'Normal', '✅ Normal') when model is unavailable.
+    """
+    if not _SKLEARN_AVAILABLE or df_run.empty:
+        return 100, "Normal", "✅ Normal"
+
+    if product == "QUARK":
+        scores = []
+        for result in (_compute_quark_ferm_score(df_run), _compute_quark_sep_score(df_run)):
+            if result is not None:
+                scores.append(result[0])
+        ml_score = sum(scores) / len(scores) if scores else 0.0
+    else:
+        result = _compute_ml_run_score(df_run, product)
+        ml_score = result[0] if result is not None else 0.0
+
+    status, badge = _score_status(ml_score)
+    return _anomaly_to_stability(ml_score), status, badge
+
+
 def _compute_quark_ferm_score(df_run: pd.DataFrame) -> tuple[float, float] | None:
     """Normalised QUARK Fermentation Health score.  Returns (score, threshold) or None."""
     if not _SKLEARN_AVAILABLE:
@@ -1519,19 +1561,20 @@ def _render_similar_runs_panel(
     with st.container(border=True):
         for sr in similar:
             sim_pct = int(sr["similarity"] * 100)
+            df_sim  = ts[ts["run_id"] == sr["run_id"]]
+            stab, _, sim_badge = _compute_run_stability(df_sim, target_product)
             col_info, col_btn = st.columns([3, 1])
             with col_info:
                 st.markdown(
                     f"**{sr['run_id']}** · {sr['scenario']} · {sr['scale']}  \n"
                     f"Similarity: **{sim_pct}%**  ·  "
+                    f"Stability: **{stab}/100** {sim_badge}  ·  "
                     f"Downtime: {sr['downtime_minutes']:.0f} min  ·  "
                     f"Yield loss: {sr['yield_loss_pct']:.1f}%"
                 )
                 badges: list[str] = []
                 if sr["extra_cleaning"]:
                     badges.append("extra CIP")
-                if sr["fouling_grade"] not in ("NONE", "nan", ""):
-                    badges.append(f"fouling: {sr['fouling_grade']}")
                 if badges:
                     st.caption("  ·  ".join(badges))
             with col_btn:
@@ -1809,7 +1852,7 @@ def render_main(
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
-        _render_right_panel(mode, run_row, lab_row, story)
+        _render_right_panel(mode, run_row, lab_row, story, df_run=run_ts)
         if df_baseline is not None:
             _render_divergence_panel(
                 run_ts, df_baseline, run_row["product"], x_range, selected_step,
@@ -2305,6 +2348,7 @@ def _render_right_panel(
     run_row: pd.Series,
     lab_row: pd.Series | None,
     story:   dict | None,
+    df_run:  pd.DataFrame | None = None,
 ) -> None:
     # Outcomes
     st.subheader("Run outcomes")
@@ -2317,10 +2361,29 @@ def _render_right_panel(
             st.caption("Lab result not found.")
 
         o1, o2 = st.columns(2)
-        o1.metric("Yield loss",    f"{run_row['yield_loss_pct']:.1f} %")
-        o2.metric("Downtime",      f"{run_row['downtime_minutes']:.0f} min")
-        o1.metric("Fouling grade", str(run_row["fouling_grade"]))
-        o2.metric("Extra CIP",     "Yes" if run_row["extra_cleaning"] else "No")
+        o1.metric("Yield loss", f"{run_row['yield_loss_pct']:.1f} %")
+        o2.metric("Downtime",   f"{run_row['downtime_minutes']:.0f} min")
+
+        if df_run is not None and not df_run.empty and _SKLEARN_AVAILABLE:
+            product = run_row["product"]
+            if product == "QUARK":
+                ferm = _compute_quark_ferm_score(df_run)
+                sep  = _compute_quark_sep_score(df_run)
+                f_stab = _anomaly_to_stability(ferm[0]) if ferm else 100
+                s_stab = _anomaly_to_stability(sep[0])  if sep  else 100
+                f_status, f_badge = _score_status(ferm[0]) if ferm else ("Normal", "✅ Normal")
+                s_status, s_badge = _score_status(sep[0])  if sep  else ("Normal", "✅ Normal")
+                o1.metric("Ferm. Stability",  f"{f_stab} / 100")
+                o2.metric("Sep. Stability",   f"{s_stab} / 100")
+                _STATUS_FN[f_status](f_badge)
+                _STATUS_FN[s_status](s_badge)
+            else:
+                stab, status, badge = _compute_run_stability(df_run, product)
+                o1.metric("Run Stability Score", f"{stab} / 100")
+                _STATUS_FN[status](badge)
+            o2.metric("Extra CIP", "Yes" if run_row["extra_cleaning"] else "No")
+        else:
+            o2.metric("Extra CIP", "Yes" if run_row["extra_cleaning"] else "No")
 
     # Lab results
     st.subheader("Lab results")
