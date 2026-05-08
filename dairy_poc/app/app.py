@@ -981,49 +981,74 @@ def _render_divergence_panel(
     first_step = first_div["step"] if first_div else None
 
     with st.container(border=True):
+        # Legend
+        st.caption("⭐ First divergence  ·  ⚠️ Downstream divergence  ·  ✅ Signals stable")
+
         if first_step is None:
-            st.caption(
+            st.info(
                 "No significant divergence from the NORMAL reference detected across all steps."
             )
-            return
+        else:
+            for sr in step_results:
+                is_first_div = (sr["step"] == first_step)
+                is_zoomed    = (selected_step == sr["step"])
+                sl           = sr["step"].replace("_", " ").capitalize()
 
-        for sr in step_results:
-            is_first_div = (sr["step"] == first_step)
-            is_zoomed    = (selected_step == sr["step"])
-            sl           = sr["step"].replace("_", " ").capitalize()
-
-            if is_first_div:
-                icon = "⭐"           # ⭐  first divergence
-            elif sr["diverges"]:
-                icon = "⚠️"     # ⚠️  downstream divergence
-            else:
-                icon = "✅"           # ✅  stable
-
-            zoomed_tag = " *(zoomed)*" if is_zoomed else ""
-            st.markdown(f"{icon} **{sl}**{zoomed_tag}")
-
-            if not sr["diverges"]:
-                st.markdown("  - Signals stable vs reference.")
-            else:
-                bullets = _step_bullets(
-                    sr["step"], product, sr["sigs"], is_first_div, first_step,
-                )
-                if bullets:
-                    for b in bullets:
-                        st.markdown(f"  - {b}")
+                if is_first_div:
+                    icon = "⭐"
+                elif sr["diverges"]:
+                    icon = "⚠️"
                 else:
-                    for sig in [s for s in sr["sigs"] if s["diverges"]][:2]:
-                        dr = "above" if sig["mean_diff"] > 0 else "below"
-                        st.markdown(
-                            f"  - {sig['label']} differs from reference "
-                            f"({sig['mean_diff']:+.3g} {sig['unit']})."
-                        )
+                    icon = "✅"
+
+                zoomed_tag = " *(zoomed)*" if is_zoomed else ""
+                st.markdown(f"{icon} **{sl}**{zoomed_tag}")
+
+                if not sr["diverges"]:
+                    st.markdown("  - Signals stable vs reference.")
+                else:
+                    bullets = _step_bullets(
+                        sr["step"], product, sr["sigs"], is_first_div, first_step,
+                    )
+                    if bullets:
+                        for b in bullets:
+                            st.markdown(f"  - {b}")
+                    else:
+                        for sig in [s for s in sr["sigs"] if s["diverges"]][:2]:
+                            dr = "above" if sig["mean_diff"] > 0 else "below"
+                            st.markdown(
+                                f"  - {sig['label']} differs from reference "
+                                f"({sig['mean_diff']:+.3g} {sig['unit']})."
+                            )
+
+                    # Per-signal metric table hidden behind expander
+                    measured = [s for s in sr["sigs"] if s["z_mean"] > 0 or s["z_drift"] > 0]
+                    if measured:
+                        with st.expander("Advanced details"):
+                            adv_rows = [
+                                {
+                                    "Signal":    s["label"],
+                                    "Mean diff": f"{s['mean_diff']:+.3g} {s['unit']}",
+                                    "z-mean":    f"{s['z_mean']:.2f}",
+                                    "z-drift":   f"{s['z_drift']:.2f}",
+                                    "Flagged":   "yes" if s["diverges"] else "—",
+                                }
+                                for s in measured
+                            ]
+                            st.dataframe(
+                                pd.DataFrame(adv_rows),
+                                hide_index=True,
+                                use_container_width=True,
+                            )
 
         st.divider()
         st.caption(
             "Observations are relative to the NORMAL reference run. "
             "Differences in an earlier step are *consistent with*, but do not "
             "establish, a causal relationship with changes observed later."
+        )
+        st.caption(
+            "✅ No divergence = no divergence detected in monitored signals for that step."
         )
 
 
