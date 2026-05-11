@@ -4,6 +4,12 @@ Curate a fixed demo-case set from the dairy PoC synthetic dataset.
 Selects 10–12 illustrative runs covering key failure modes and process stories,
 then writes data_processed/demo_cases.json.
 
+Three stories use ML-aware or signal-aware ranking to ensure the selected run
+visibly demonstrates the intended pattern:
+  quark_normal       — lowest Fermentation Early Warning score (most normal)
+  cross_sensor_fault — highest anomaly_flag rate (most visible faults)
+  cross_drift        — largest pH slope deviation vs NORMAL (most visible drift)
+
 Usage (from dairy_poc/ directory):
     python -m src.data_gen.curate_demo_cases
     python -m src.data_gen.curate_demo_cases --demo_mode
@@ -16,18 +22,39 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
+import numpy as np
 import pandas as pd
 
 _ROOT     = Path(__file__).parents[2]
 _DATA_DIR = _ROOT / "data_raw"
 _OUT_DIR  = _ROOT / "data_processed"
 
+# ── ML constants (must match app.py exactly) ──────────────────────────────────
+_QUARK_ML_FERM_STEPS   = frozenset({"inoculation_mixing", "early_fermentation", "late_fermentation"})
+_QUARK_ML_SEP_STEP     = "separation"
+_QUARK_ML_SPEED_THRESH = 1000.0   # rpm; below = centrifuge ramp-up, excluded
+_QUARK_ML_PH_HI        = 5.2      # frac below = ferm progress marker
+_QUARK_ML_PH_LO        = 4.6      # frac below = ferm completion marker
+_ML_THRESHOLD_PCT      = 95.0     # percentile of NORMAL scores used as alert level
+
+try:
+    from sklearn.ensemble import IsolationForest
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    _SKLEARN = True
+except ImportError:
+    _SKLEARN = False
+
 
 # =============================================================================
 # STORY PLAN
 # Each tuple: (story_id, product | None, scenario_priority_list)
 # None product = any product; scenarios tried in order, first match wins.
+# cross_drift uses QUARK-only so pH slope deviation is meaningful; falls back
+# to RAW_MAT_VAR when no DRIFT run found.
 # =============================================================================
 
 _STORY_PLAN: list[tuple[str, str | None, list[str]]] = [
@@ -41,7 +68,7 @@ _STORY_PLAN: list[tuple[str, str | None, list[str]]] = [
     ("pudding_foul_1",     "HIGH_PROTEIN_PUDDING", ["FOUL", "DRIFT"]),
     ("pudding_foul_2",     "HIGH_PROTEIN_PUDDING", ["FOUL", "DRIFT"]),
     ("cross_sensor_fault", None,                   ["SENSOR_FAULT"]),
-    ("cross_drift",        None,                   ["DRIFT"]),
+    ("cross_drift",        "QUARK",                ["DRIFT", "RAW_MAT_VAR"]),
 ]
 
 
@@ -277,7 +304,214 @@ _CASE_META: dict[tuple[str, str], dict] = {
         "key_events_expected": [],
         "critical_steps": [],
     },
+
+    # Substitute used when cross_drift falls back to RAW_MAT_VAR
+    ("QUARK", "RAW_MAT_VAR_DRIFT_LIKE"): {
+        "short_title": "Quark: Raw-material drift (strongest available)",
+        "narrative": (
+            "No strong DRIFT run was available; this RAW_MAT_VAR run shows the largest "
+            "pH trajectory deviation from the NORMAL baseline and serves as the best "
+            "available proxy for a drift-like fermentation pattern."
+        ),
+        "what_to_watch": [
+            "pH slope in late_fermentation: compare directly against the NORMAL baseline",
+            "raw_protein_pct in run metadata: off-baseline blend driving the deviation",
+            "anomaly_flag: may be elevated in fermentation steps",
+        ],
+        "key_events_expected": ["inoculation", "rennet_addition"],
+        "critical_steps": ["early_fermentation", "late_fermentation"],
+    },
 }
+
+
+# =============================================================================
+# FEATURE EXTRACTION  (mirrors of app.py — no Streamlit dependency)
+# =============================================================================
+
+def _ferm_features(run_ts: pd.DataFrame) -> list[float]:
+    """6-dim fermentation health vector. Mirrors app.py _extract_quark_ferm_features."""
+    if "step" not in run_ts.columns:
+        return [0.0] * 6
+    ferm = run_ts[run_ts["step"].isin(_QUARK_ML_FERM_STEPS)]
+    late = run_ts[run_ts["step"] == "late_fermentation"]
+    ph   = ferm["pH"].dropna() if "pH" in ferm.columns else pd.Series(dtype=float)
+    if len(ph) < 10:
+        return [0.0] * 6
+    t_all = ferm.loc[ph.index, "t_min"].values.astype(float)
+    v_all = ph.values.astype(float)
+    ph_late = late["pH"].dropna() if "pH" in late.columns else pd.Series(dtype=float)
+    t_late  = late.loc[ph_late.index, "t_min"].values.astype(float) if not ph_late.empty else np.array([])
+    v_late  = ph_late.values.astype(float)
+    late_slope = (
+        float(np.polyfit(t_late, v_late, 1)[0]) if len(v_late) > 3
+        else float(np.polyfit(t_all,  v_all,  1)[0])
+    )
+    return [
+        float(v_all.mean()),
+        late_slope,
+        float(v_all.min()),
+        float(v_all.max() - v_all.min()),
+        float((v_all < _QUARK_ML_PH_HI).mean()),
+        float((v_all < _QUARK_ML_PH_LO).mean()),
+    ]
+
+
+def _sep_features(run_ts: pd.DataFrame) -> list[float]:
+    """6-dim separation stability vector. Mirrors app.py _extract_quark_sep_features."""
+    if "step" not in run_ts.columns:
+        return [0.0] * 6
+    sep = run_ts[
+        (run_ts["step"] == _QUARK_ML_SEP_STEP) &
+        (run_ts["separator_speed_rpm"].fillna(0.0) > _QUARK_ML_SPEED_THRESH)
+    ]
+    dp = sep["separation_deltaP"].dropna() if "separation_deltaP" in sep.columns else pd.Series(dtype=float)
+    if len(dp) < 5:
+        return [0.0] * 6
+    t    = sep.loc[dp.index, "t_min"].values.astype(float)
+    v_dp = dp.values.astype(float)
+    v_sp = sep.loc[dp.index, "separator_speed_rpm"].fillna(0.0).values.astype(float)
+    dp_slope = float(np.polyfit(t, v_dp, 1)[0]) if len(t) > 3 else 0.0
+    return [
+        float(v_dp.mean()),
+        float(v_dp.std()),
+        float(v_dp.max()),
+        dp_slope,
+        float(v_sp.mean()),
+        float(v_sp.std()),
+    ]
+
+
+# =============================================================================
+# SCORER BUILDERS
+# =============================================================================
+
+def _build_quark_scorers(
+    runs_df: pd.DataFrame,
+    ts_df:   pd.DataFrame,
+) -> tuple[Callable | None, Callable | None]:
+    """Train IsolationForest on QUARK/NORMAL runs (mirrors app.py _load_ml_models).
+
+    Returns (ferm_scorer, sep_scorer) where each is Callable[[run_ts], float].
+    Returns (None, None) when sklearn is unavailable or training set is too small.
+    """
+    if not _SKLEARN:
+        return None, None
+
+    q_ids = runs_df.loc[
+        (runs_df["product"] == "QUARK") & (runs_df["scenario"] == "NORMAL"), "run_id"
+    ]
+    if len(q_ids) < 5:
+        return None, None
+
+    def _make_pipe() -> Pipeline:
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler",  StandardScaler()),
+            ("iso",     IsolationForest(n_estimators=100, contamination="auto", random_state=42)),
+        ])
+
+    def _fit(pipe: Pipeline, X: np.ndarray) -> tuple[Pipeline, float]:
+        pipe.fit(X)
+        thr = float(np.percentile((-pipe.score_samples(X)).clip(min=0), _ML_THRESHOLD_PCT))
+        return pipe, max(thr, 1e-9)
+
+    fv = [_ferm_features(ts_df[ts_df["run_id"] == r]) for r in q_ids]
+    sv = [_sep_features( ts_df[ts_df["run_id"] == r]) for r in q_ids]
+    ferm_pipe, ferm_thr = _fit(_make_pipe(), np.array(fv, dtype=float))
+    sep_pipe,  sep_thr  = _fit(_make_pipe(), np.array(sv, dtype=float))
+
+    def ferm_scorer(run_ts: pd.DataFrame) -> float:
+        feats = np.array([_ferm_features(run_ts)], dtype=float)
+        return float((-ferm_pipe.score_samples(feats)).clip(min=0)[0]) / ferm_thr
+
+    def sep_scorer(run_ts: pd.DataFrame) -> float:
+        feats = np.array([_sep_features(run_ts)], dtype=float)
+        return float((-sep_pipe.score_samples(feats)).clip(min=0)[0]) / sep_thr
+
+    return ferm_scorer, sep_scorer
+
+
+def _normal_late_ferm_ph_slope(runs_df: pd.DataFrame, ts_df: pd.DataFrame) -> float:
+    """Mean pH slope in late_fermentation across all QUARK/NORMAL runs."""
+    q_ids = runs_df.loc[
+        (runs_df["product"] == "QUARK") & (runs_df["scenario"] == "NORMAL"), "run_id"
+    ]
+    slopes = []
+    for rid in q_ids:
+        late = ts_df[(ts_df["run_id"] == rid) & (ts_df["step"] == "late_fermentation")]
+        ph = late["pH"].dropna() if "pH" in late.columns else pd.Series(dtype=float)
+        if len(ph) > 3:
+            t = late.loc[ph.index, "t_min"].values.astype(float)
+            slopes.append(float(np.polyfit(t, ph.values.astype(float), 1)[0]))
+    return float(np.mean(slopes)) if slopes else -0.005
+
+
+# =============================================================================
+# RANKER FACTORIES  (return value convention: lower = picked first)
+# =============================================================================
+
+def _mk_rank_quark_normal(
+    ferm_scorer: Callable,
+    sep_scorer:  Callable,
+) -> Callable[[str, pd.DataFrame], tuple[float, dict]]:
+    """Lowest ferm score first; tie-break by sep score."""
+    def rank(run_id: str, run_ts: pd.DataFrame) -> tuple[float, dict]:
+        f = ferm_scorer(run_ts)
+        s = sep_scorer(run_ts)
+        return f + 0.001 * s, {"ferm_score": round(f, 4), "sep_score": round(s, 4)}
+    return rank
+
+
+def _mk_rank_sensor_fault() -> Callable[[str, pd.DataFrame], tuple[float, dict]]:
+    """Highest anomaly_flag rate first (negated so lower = more faulty)."""
+    def rank(run_id: str, run_ts: pd.DataFrame) -> tuple[float, dict]:
+        if "anomaly_flag" not in run_ts.columns or run_ts.empty:
+            return 0.0, {"anomaly_flag_pct": 0.0}
+        rate = float(run_ts["anomaly_flag"].fillna(0).astype(float).mean())
+        return -rate, {"anomaly_flag_pct": round(rate * 100, 2)}
+    return rank
+
+
+def _mk_rank_drift(
+    normal_slope: float,
+    ferm_scorer:  Callable | None = None,
+) -> Callable[[str, pd.DataFrame], tuple[float, dict]]:
+    """Pick the DRIFT run that most visibly deviates from normal.
+
+    Primary key : ML Fermentation Early Warning score (highest = most visible in UI).
+    Tiebreaker  : pH slope deviation vs NORMAL baseline.
+    When ferm_scorer is unavailable, slope deviation is used alone.
+    Score is negated so the ranker convention (lower = better) is preserved.
+    """
+    def rank(run_id: str, run_ts: pd.DataFrame) -> tuple[float, dict]:
+        # Slope deviation (always computable)
+        late  = run_ts[run_ts["step"] == "late_fermentation"]
+        ph    = late["pH"].dropna() if "pH" in late.columns else pd.Series(dtype=float)
+        slope = None
+        dev   = 0.0
+        if len(ph) >= 5:
+            t     = late.loc[ph.index, "t_min"].values.astype(float)
+            slope = float(np.polyfit(t, ph.values.astype(float), 1)[0])
+            dev   = abs(slope - normal_slope)
+
+        # ML ferm score (preferred primary key when available)
+        if ferm_scorer is not None:
+            f = ferm_scorer(run_ts)
+            # Primary: highest ferm score; tiebreak: largest slope deviation
+            key = -(f + 0.001 * dev)
+            detail = {
+                "ferm_score": round(f, 4),
+                "ph_slope":   round(slope, 6) if slope is not None else None,
+                "slope_dev":  round(dev, 6),
+            }
+        else:
+            key    = -dev
+            detail = {
+                "ph_slope":  round(slope, 6) if slope is not None else None,
+                "slope_dev": round(dev, 6),
+            }
+        return key, detail
+    return rank
 
 
 # =============================================================================
@@ -298,11 +532,20 @@ def _load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame
 
 def _pick_run(
     runs_df:   pd.DataFrame,
+    ts_df:     pd.DataFrame,
     product:   str | None,
     scenarios: list[str],
     used:      set[str],
-) -> tuple[str | None, str, str]:
-    """Try each scenario in order. Return (run_id, matched_scenario, why) or (None, '', '')."""
+    rank_fn:   Callable[[str, pd.DataFrame], tuple[float, dict]] | None = None,
+) -> tuple[str | None, str, str, dict]:
+    """Try each scenario in order.
+
+    Returns (run_id, matched_scenario, why_string, rank_detail) or (None, '', '', {}).
+
+    When rank_fn is given it is called for every candidate; the one returning the
+    lowest score is selected.  rank_fn returns (score, detail_dict).
+    When rank_fn is None the first PRODUCTION-scale candidate wins (original behaviour).
+    """
     for scenario in scenarios:
         mask = runs_df["scenario"] == scenario
         if product is not None:
@@ -313,20 +556,38 @@ def _pick_run(
         if candidates.empty:
             continue
 
-        # Prefer PRODUCTION scale: lower noise_multiplier gives cleaner demo signals
-        prod = candidates[candidates["scale"] == "PRODUCTION"]
-        pool = prod if not prod.empty else candidates
-        row  = pool.iloc[0]
+        if rank_fn is not None:
+            scored: list[tuple[float, str, dict]] = []
+            for rid in candidates["run_id"]:
+                run_ts = ts_df[ts_df["run_id"] == rid]
+                try:
+                    score, detail = rank_fn(rid, run_ts)
+                except Exception:
+                    score, detail = float("inf"), {}
+                scored.append((score, rid, detail))
+            scored.sort(key=lambda x: x[0])
+            best_score, rid, rank_detail = scored[0]
+            row = candidates[candidates["run_id"] == rid].iloc[0]
+            n   = len(candidates)
+            why = (
+                f"{scenario} {row['product'].replace('HIGH_PROTEIN_PUDDING', 'PUDDING')}"
+                f" — ranked {n} candidates, scale={row['scale']}"
+            )
+            return str(rid), scenario, why, rank_detail
 
-        n   = len(candidates)
-        why = (
-            f"{scenario} {row['product'].replace('HIGH_PROTEIN_PUDDING', 'PUDDING')}"
-            f" — {'only match' if n == 1 else f'{n} available'},"
-            f" scale={row['scale']}"
-        )
-        return str(row["run_id"]), scenario, why
+        else:
+            prod = candidates[candidates["scale"] == "PRODUCTION"]
+            pool = prod if not prod.empty else candidates
+            row  = pool.iloc[0]
+            n    = len(candidates)
+            why  = (
+                f"{scenario} {row['product'].replace('HIGH_PROTEIN_PUDDING', 'PUDDING')}"
+                f" — {'only match' if n == 1 else f'{n} available'},"
+                f" scale={row['scale']}"
+            )
+            return str(row["run_id"]), scenario, why, {}
 
-    return None, "", ""
+    return None, "", "", {}
 
 
 def _build_run_summary(
@@ -362,15 +623,34 @@ def _build_run_summary(
 
 def _select_cases(
     runs_df: pd.DataFrame,
+    ts_df:   pd.DataFrame,
     lab_df:  pd.DataFrame,
 ) -> tuple[list[dict], list[str]]:
     """Select one run per story slot. Returns (cases, selection_warnings)."""
-    used:     set[str]  = set()
+
+    # Build ML scorers for quark_normal; compute NORMAL baseline for cross_drift
+    ferm_scorer, sep_scorer = _build_quark_scorers(runs_df, ts_df)
+    normal_slope = _normal_late_ferm_ph_slope(runs_df, ts_df)
+
+    if ferm_scorer is None:
+        print("  [WARN] sklearn unavailable — quark_normal will use default PRODUCTION ranking.")
+
+    rankers: dict[str, Callable] = {
+        "cross_sensor_fault": _mk_rank_sensor_fault(),
+        "cross_drift":        _mk_rank_drift(normal_slope, ferm_scorer),
+    }
+    if ferm_scorer is not None:
+        rankers["quark_normal"] = _mk_rank_quark_normal(ferm_scorer, sep_scorer)
+
+    used:     set[str]   = set()
     cases:    list[dict] = []
     warnings: list[str]  = []
 
     for story_id, product, scenarios in _STORY_PLAN:
-        run_id, matched, why = _pick_run(runs_df, product, scenarios, used)
+        rank_fn = rankers.get(story_id)
+        run_id, matched, why, rank_detail = _pick_run(
+            runs_df, ts_df, product, scenarios, used, rank_fn
+        )
 
         if run_id is None:
             warnings.append(
@@ -382,12 +662,17 @@ def _select_cases(
             continue
 
         used.add(run_id)
-        row = runs_df[runs_df["run_id"] == run_id].iloc[0]
+        row      = runs_df[runs_df["run_id"] == run_id].iloc[0]
         prod_key = str(row["product"])
 
-        # Resolve metadata: product-specific first, then ANY
+        # For cross_drift: if we fell back to RAW_MAT_VAR, use drift-like metadata
+        if story_id == "cross_drift" and matched == "RAW_MAT_VAR":
+            meta_key = ("QUARK", "RAW_MAT_VAR_DRIFT_LIKE")
+        else:
+            meta_key = (prod_key, matched)
+
         meta = (
-            _CASE_META.get((prod_key, matched))
+            _CASE_META.get(meta_key)
             or _CASE_META.get(("ANY", matched))
             or {}
         )
@@ -399,11 +684,12 @@ def _select_cases(
             "scale":               str(row["scale"]),
             "scenario":            matched,
             "why_selected":        why,
+            "rank_detail":         rank_detail,
             "short_title":         meta.get("short_title", f"{matched} — {prod_key}"),
             "narrative":           meta.get("narrative", ""),
             "what_to_watch":       meta.get("what_to_watch", []),
             "key_events_expected": meta.get("key_events_expected", []),
-            "_critical_steps":     meta.get("critical_steps", []),  # used for validation only
+            "_critical_steps":     meta.get("critical_steps", []),
             "run_summary":         _build_run_summary(run_id, runs_df, lab_df),
         })
 
@@ -456,7 +742,7 @@ def _validate_cases(
                 )
 
         if rid not in ids_ts:
-            continue  # can't check steps if timeseries is missing
+            continue
 
         steps_present = set(ts_df.loc[ts_df["run_id"] == rid, "step"].unique())
         for step in case["_critical_steps"]:
@@ -479,13 +765,15 @@ def _print_table(cases: list[dict], warnings: list[str]) -> None:
     col_product  = 22
     col_scenario = 30
     col_scale    = 12
+    col_score    = 20
 
     header = (
         f"{'story_id':<{col_story}} "
         f"{'run_id':<{col_run}} "
         f"{'product':<{col_product}} "
         f"{'scenario':<{col_scenario}} "
-        f"{'scale':<{col_scale}}"
+        f"{'scale':<{col_scale}} "
+        f"{'key score':<{col_score}}"
     )
     sep = "-" * len(header)
 
@@ -495,12 +783,24 @@ def _print_table(cases: list[dict], warnings: list[str]) -> None:
 
     for c in cases:
         prod_short = c["product"].replace("HIGH_PROTEIN_PUDDING", "PUDDING")
+        rd = c.get("rank_detail", {})
+        if "ferm_score" in rd and "sep_score" in rd:
+            score_str = f"ferm={rd['ferm_score']:.4f} sep={rd['sep_score']:.4f}"
+        elif "ferm_score" in rd:
+            score_str = f"ferm={rd['ferm_score']:.4f} slope_dev={rd.get('slope_dev','?')}"
+        elif "anomaly_flag_pct" in rd:
+            score_str = f"anomaly_flag={rd['anomaly_flag_pct']:.1f}%"
+        elif "slope_dev" in rd and rd["slope_dev"] is not None:
+            score_str = f"slope_dev={rd['slope_dev']:.6f}"
+        else:
+            score_str = "—"
         print(
             f"{c['story_id']:<{col_story}} "
             f"{c['run_id']:<{col_run}} "
             f"{prod_short:<{col_product}} "
             f"{c['scenario']:<{col_scenario}} "
-            f"{c['scale']:<{col_scale}}"
+            f"{c['scale']:<{col_scale}} "
+            f"{score_str:<{col_score}}"
         )
 
     if warnings:
@@ -607,14 +907,17 @@ def main() -> None:
     else:
         print(f"  {n_foul} Pudding FOUL run(s) available — no regeneration needed.")
 
+    print(f"  NORMAL late_fermentation pH slope baseline: "
+          f"{_normal_late_ferm_ph_slope(runs, ts):.6f} pH/min")
+
     # Select and validate ─────────────────────────────────────────────────────
-    cases, sel_warnings = _select_cases(runs, lab)
+    cases, sel_warnings = _select_cases(runs, ts, lab)
     val_warnings = _validate_cases(cases, runs, ts, lab, evts)
     all_warnings = sel_warnings + val_warnings
 
     _print_table(cases, all_warnings)
 
-    # Strip internal validation field before writing ──────────────────────────
+    # Strip internal fields before writing ────────────────────────────────────
     stories = [
         {k: v for k, v in c.items() if not k.startswith("_")}
         for c in cases

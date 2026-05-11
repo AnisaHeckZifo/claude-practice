@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-11T07:50:30.154595+00:00",
+  "generated_at": "2026-05-11T08:20:19.455533+00:00",
   "dataset_stats": {
     "n_runs": 200,
     "timeseries_rows": 106451,
@@ -14,11 +14,15 @@
   "stories": [
     {
       "story_id": "quark_normal",
-      "run_id": "RUN-0010",
+      "run_id": "RUN-0119",
       "product": "QUARK",
-      "scale": "PRODUCTION",
+      "scale": "TECHNIKUM",
       "scenario": "NORMAL",
-      "why_selected": "NORMAL QUARK — 43 available, scale=PRODUCTION",
+      "why_selected": "NORMAL QUARK — ranked 43 candidates, scale=TECHNIKUM",
+      "rank_detail": {
+        "ferm_score": 0.6641,
+        "sep_score": 0.7675
+      },
       "short_title": "Quark: Healthy fermentation baseline",
       "narrative": "Fermentation proceeds on schedule; pH reaches the 4.5 target within the expected 8–12 h window. Gel break and centrifuge separation complete cleanly, and the product leaves standardisation within spec.",
       "what_to_watch": [
@@ -36,14 +40,14 @@
         "filling_start"
       ],
       "run_summary": {
-        "total_duration_hr": 17.387,
+        "total_duration_hr": 16.541,
         "result_flag": "PASS",
-        "yield_loss_pct": 0.525,
-        "scale": "PRODUCTION",
-        "gel_break_time_min": 7.6,
-        "fermentation_time_hr": 12.46,
-        "final_pH_offline": 4.502,
-        "d50_um": 28.46
+        "yield_loss_pct": 0.99,
+        "scale": "TECHNIKUM",
+        "gel_break_time_min": 14.2,
+        "fermentation_time_hr": 13.35,
+        "final_pH_offline": 4.583,
+        "d50_um": 35.21
       }
     },
     {
@@ -53,6 +57,7 @@
       "scale": "TECHNIKUM",
       "scenario": "OVER_ACID",
       "why_selected": "OVER_ACID QUARK — 3 available, scale=TECHNIKUM",
+      "rank_detail": {},
       "short_title": "Quark: Over-acidified curd",
       "narrative": "Culture activity runs faster than target, driving final pH below 4.4. The over-acidified curd shows reduced viscosity and finer particles (lower d50_um) at lab sampling.",
       "what_to_watch": [
@@ -85,6 +90,7 @@
       "scale": "PRODUCTION",
       "scenario": "STALL_FERMENT",
       "why_selected": "STALL_FERMENT QUARK — 2 available, scale=PRODUCTION",
+      "rank_detail": {},
       "short_title": "Quark: Stalled fermentation — run scrapped",
       "narrative": "Acidification halts at pH ~5.5 roughly one-third of the way through late fermentation. The batch is abandoned; yield_loss exceeds 80 % and fermentation_time_hr is recorded as 99 (did-not-complete sentinel).",
       "what_to_watch": [
@@ -116,6 +122,7 @@
       "scale": "PRODUCTION",
       "scenario": "SEPARATION_ISSUE",
       "why_selected": "SEPARATION_ISSUE QUARK — 4 available, scale=PRODUCTION",
+      "rank_detail": {},
       "short_title": "Quark: Centrifuge underperformance",
       "narrative": "Centrifuge back-pressure drifts upward during separation, restricting throughput and reducing whey removal efficiency. Final protein content falls below the 10 % lower spec limit.",
       "what_to_watch": [
@@ -147,6 +154,7 @@
       "scale": "PRODUCTION",
       "scenario": "RAW_MAT_VAR",
       "why_selected": "RAW_MAT_VAR QUARK — 11 available, scale=PRODUCTION",
+      "rank_detail": {},
       "short_title": "Quark: Raw-milk protein variability",
       "narrative": "The incoming milk blend has an off-baseline protein content, which propagates through fermentation rate and into the final product protein level.",
       "what_to_watch": [
@@ -177,6 +185,7 @@
       "scale": "PRODUCTION",
       "scenario": "NORMAL",
       "why_selected": "NORMAL PUDDING — 55 available, scale=PRODUCTION",
+      "rank_detail": {},
       "short_title": "Pudding: Clean heat-treatment baseline",
       "narrative": "Mixing, heating, and holding all complete within setpoint tolerances. No fouling signal appears on the heat exchanger; the product reaches fill temperature on target.",
       "what_to_watch": [
@@ -204,6 +213,7 @@
       "scale": "PRODUCTION",
       "scenario": "BLOCK",
       "why_selected": "BLOCK PUDDING — 9 available, scale=PRODUCTION",
+      "rank_detail": {},
       "short_title": "Pudding: Partial line blockage",
       "narrative": "A partial obstruction develops mid-run in one of the transfer lines, causing a sudden flow drop and a compensatory pressure spike lasting up to 25 minutes.",
       "what_to_watch": [
@@ -232,6 +242,7 @@
       "scale": "PRODUCTION",
       "scenario": "FOUL",
       "why_selected": "FOUL PUDDING — 5 available, scale=PRODUCTION",
+      "rank_detail": {},
       "short_title": "Pudding: Progressive heat-exchanger fouling",
       "narrative": "Protein and mineral deposits accumulate on heat-exchanger surfaces during heating and holding. The fouling signal builds progressively: outlet temperature drops, back-pressure rises, and deltaT across the exchanger climbs — triggering an extra CIP cycle.",
       "what_to_watch": [
@@ -261,6 +272,7 @@
       "scale": "TECHNIKUM",
       "scenario": "FOUL",
       "why_selected": "FOUL PUDDING — 4 available, scale=TECHNIKUM",
+      "rank_detail": {},
       "short_title": "Pudding: Progressive heat-exchanger fouling",
       "narrative": "Protein and mineral deposits accumulate on heat-exchanger surfaces during heating and holding. The fouling signal builds progressively: outlet temperature drops, back-pressure rises, and deltaT across the exchanger climbs — triggering an extra CIP cycle.",
       "what_to_watch": [
@@ -289,7 +301,10 @@
       "product": "HIGH_PROTEIN_PUDDING",
       "scale": "PRODUCTION",
       "scenario": "SENSOR_FAULT",
-      "why_selected": "SENSOR_FAULT PUDDING — 15 available, scale=PRODUCTION",
+      "why_selected": "SENSOR_FAULT PUDDING — ranked 15 candidates, scale=PRODUCTION",
+      "rank_detail": {
+        "anomaly_flag_pct": 6.41
+      },
       "short_title": "Cross-product: Instrument spike anomalies",
       "narrative": "Intermittent sensor faults produce isolated temperature spikes — either well above or below the expected process range — flagged by anomaly_flag = 1 in the timeseries.",
       "what_to_watch": [
@@ -309,11 +324,16 @@
     },
     {
       "story_id": "cross_drift",
-      "run_id": "RUN-0007",
+      "run_id": "RUN-0182",
       "product": "QUARK",
-      "scale": "PRODUCTION",
+      "scale": "TECHNIKUM",
       "scenario": "DRIFT",
-      "why_selected": "DRIFT QUARK — 28 available, scale=PRODUCTION",
+      "why_selected": "DRIFT QUARK — ranked 12 candidates, scale=TECHNIKUM",
+      "rank_detail": {
+        "ferm_score": 1.0414,
+        "ph_slope": -0.003332,
+        "slope_dev": 0.000352
+      },
       "short_title": "Cross-product: Gradual process drift",
       "narrative": "Process conditions drift slowly across the run: temperature rises and flow rate declines in a time-correlated pattern typical of a gradually degrading process.",
       "what_to_watch": [
@@ -323,14 +343,14 @@
       ],
       "key_events_expected": [],
       "run_summary": {
-        "total_duration_hr": 15.001,
+        "total_duration_hr": 18.216,
         "result_flag": "PASS",
-        "yield_loss_pct": 1.043,
-        "scale": "PRODUCTION",
-        "gel_break_time_min": 11.2,
-        "fermentation_time_hr": 13.84,
-        "final_pH_offline": 4.572,
-        "d50_um": 24.91
+        "yield_loss_pct": 2.437,
+        "scale": "TECHNIKUM",
+        "gel_break_time_min": 23.5,
+        "fermentation_time_hr": 12.88,
+        "final_pH_offline": 4.555,
+        "d50_um": 28.08
       }
     }
   ]
