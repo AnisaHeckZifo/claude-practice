@@ -1450,6 +1450,177 @@ def _render_score_trend_chart(
     else:
         _render_pudding_trend(df_run, product, run_evts, x_range, run_id)
 
+
+# =============================================================================
+# MEASUREMENT QUALITY PANEL
+# =============================================================================
+
+# Per-product signal configs: (col, label, step_scope)
+# step_scope = None means "all rows where the column is not structurally null"
+_MQ_QUARK_SIGNALS: list[tuple[str, str, str | None]] = [
+    ("temperature_C",       "Temperature",      None),
+    ("pressure_bar",        "Pressure",         None),
+    ("pH",                  "pH",               None),
+    ("flow_rate_lpm",       "Flow rate",        None),
+    ("separator_speed_rpm", "Centrifuge speed", "separation"),
+    ("separation_deltaP",   "Sep. ΔP",          "separation"),
+]
+
+_MQ_PUDDING_SIGNALS: list[tuple[str, str, str | None]] = [
+    ("temperature_C",         "Temperature", None),
+    ("pressure_bar",          "Pressure",    None),
+    ("pH",                    "pH",          None),
+    ("flow_rate_lpm",         "Flow rate",   None),
+    ("deltaT_heat_exchanger", "HX ΔT",       None),
+]
+
+_MQ_SPIKE_Z       = 3.5   # z-score threshold for spike detection
+_MQ_SPIKE_SUSPECT = 0.01  # 1 % spike rate → Suspect
+_MQ_SPIKE_POOR    = 0.05  # 5 % spike rate → Poor
+_MQ_MISS_SUSPECT  = 0.05  # 5 % missingness → Suspect
+_MQ_MISS_POOR     = 0.20  # 20 % missingness → Poor
+
+
+def _compute_measurement_quality(
+    run_ts:  pd.DataFrame,
+    product: str,
+) -> list[dict]:
+    """Return one dict per signal with spike/missingness statistics.
+
+    Each dict: {col, label, n_rows, spike_count, miss_count,
+                spike_rate, miss_rate, status, triggered}
+    status in {"OK", "Suspect", "Poor"}; triggered is a human-readable note.
+    """
+    configs = _MQ_QUARK_SIGNALS if product == "QUARK" else _MQ_PUDDING_SIGNALS
+    results = []
+
+    for col, label, step_scope in configs:
+        # Scope to the relevant step rows if specified
+        if step_scope is not None:
+            scope = run_ts[run_ts["step"] == step_scope]
+        else:
+            scope = run_ts
+
+        if scope.empty or col not in scope.columns:
+            continue
+
+        series = scope[col]
+        n_rows    = len(series)
+        miss_count = int(series.isna().sum())
+        valid      = series.dropna()
+
+        # Per-step z-score spike detection on valid values
+        step_col = scope.loc[valid.index, "step"]
+        step_mean = step_col.map(valid.groupby(step_col).mean())
+        step_std  = step_col.map(valid.groupby(step_col).std())
+        z = (valid - step_mean).abs() / step_std.replace(0, np.nan)
+        spike_count = int((z > _MQ_SPIKE_Z).sum())
+
+        spike_rate = spike_count / n_rows if n_rows > 0 else 0.0
+        miss_rate  = miss_count  / n_rows if n_rows > 0 else 0.0
+
+        # Status logic: worst of spike / missingness
+        triggered_parts: list[str] = []
+        if spike_rate >= _MQ_SPIKE_POOR:
+            spike_status = "Poor"
+            triggered_parts.append(f"{label} spikes ({spike_rate:.1%})")
+        elif spike_rate >= _MQ_SPIKE_SUSPECT:
+            spike_status = "Suspect"
+            triggered_parts.append(f"{label} spikes ({spike_rate:.1%})")
+        else:
+            spike_status = "OK"
+
+        if miss_rate >= _MQ_MISS_POOR:
+            miss_status = "Poor"
+            triggered_parts.append(f"{label} dropouts ({miss_rate:.1%})")
+        elif miss_rate >= _MQ_MISS_SUSPECT:
+            miss_status = "Suspect"
+            triggered_parts.append(f"{label} dropouts ({miss_rate:.1%})")
+        else:
+            miss_status = "OK"
+
+        rank = {"OK": 0, "Suspect": 1, "Poor": 2}
+        status = max(spike_status, miss_status, key=lambda s: rank[s])
+
+        results.append({
+            "col":         col,
+            "label":       label,
+            "n_rows":      n_rows,
+            "spike_count": spike_count,
+            "miss_count":  miss_count,
+            "spike_rate":  spike_rate,
+            "miss_rate":   miss_rate,
+            "status":      status,
+            "triggered":   "; ".join(triggered_parts) if triggered_parts else "",
+        })
+
+    return results
+
+
+def _render_measurement_quality_panel(
+    run_ts:  pd.DataFrame,
+    product: str,
+    story:   "dict | None",
+) -> None:
+    """Render the Measurement Quality panel."""
+    if run_ts.empty:
+        return
+
+    st.subheader("Measurement Quality (in-/at-line)")
+
+    if story and story.get("story_id") == "cross_sensor_fault":
+        st.info("This story highlights measurement integrity.")
+
+    st.caption(
+        "This panel assesses sensor data quality (spikes, dropouts) and does **not** "
+        "imply a process fault. Measurement issues are handled separately from process "
+        "Early Warning scores."
+    )
+
+    signal_rows = _compute_measurement_quality(run_ts, product)
+    if not signal_rows:
+        st.caption("No in-/at-line signal data available.")
+        return
+
+    # Overall status = worst individual status
+    rank = {"OK": 0, "Suspect": 1, "Poor": 2}
+    overall = max(signal_rows, key=lambda r: rank[r["status"]])["status"]
+    colour  = {"OK": "normal", "Suspect": "off", "Poor": "inverse"}
+    icon    = {"OK": "checkmark", "Suspect": "warning", "Poor": "error"}
+    st.metric(
+        "Overall measurement quality",
+        overall,
+        delta=None,
+        label_visibility="visible",
+    )
+
+    # List triggered signals
+    flagged = [r for r in signal_rows if r["triggered"]]
+    if flagged:
+        bullets = "  \n".join(f"- {r['triggered']}" for r in flagged)
+        st.markdown(bullets)
+
+    # Per-signal breakdown in an expander
+    with st.expander("Per-signal breakdown", expanded=(overall != "OK")):
+        display_rows = []
+        for r in signal_rows:
+            status_icon = {"OK": "✅", "Suspect": "⚠️", "Poor": "🔴"}.get(r["status"], "")
+            display_rows.append({
+                "Signal":       r["label"],
+                "Status":       f"{status_icon} {r['status']}",
+                "Spike rate":   f"{r['spike_rate']:.1%}",
+                "Dropout rate": f"{r['miss_rate']:.1%}",
+                "Rows checked": r["n_rows"],
+            })
+        st.dataframe(
+            pd.DataFrame(display_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.divider()
+
+
 # =============================================================================
 # SIMILAR RUNS  (cosine similarity on product-aware run feature vectors)
 # =============================================================================
@@ -1891,6 +2062,7 @@ def render_main(
         _render_process_timeline(run_ts, run_evts, selected_step)
         _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
         _render_score_trend_chart(run_ts, run_row["product"], run_evts, x_range, selected_step, run_id)
+        _render_measurement_quality_panel(run_ts, run_row["product"], story)
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
