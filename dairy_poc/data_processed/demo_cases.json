@@ -1,13 +1,16 @@
 {
-  "generated_at": "2026-05-07T14:11:24.398840+00:00",
+  "generated_at": "2026-05-11T07:50:30.154595+00:00",
   "dataset_stats": {
     "n_runs": 200,
-    "timeseries_rows": 111822,
+    "timeseries_rows": 106451,
     "lab_results": 200,
-    "events": 657
+    "events": 622
   },
   "n_cases": 11,
-  "warnings": [],
+  "warnings": [
+    "[WARN] RUN-0110: absent from events.csv",
+    "[WARN] RUN-0009: absent from events.csv"
+  ],
   "stories": [
     {
       "story_id": "quark_normal",
@@ -15,7 +18,7 @@
       "product": "QUARK",
       "scale": "PRODUCTION",
       "scenario": "NORMAL",
-      "why_selected": "NORMAL QUARK — 33 available, scale=PRODUCTION",
+      "why_selected": "NORMAL QUARK — 43 available, scale=PRODUCTION",
       "short_title": "Quark: Healthy fermentation baseline",
       "narrative": "Fermentation proceeds on schedule; pH reaches the 4.5 target within the expected 8–12 h window. Gel break and centrifuge separation complete cleanly, and the product leaves standardisation within spec.",
       "what_to_watch": [
@@ -33,29 +36,30 @@
         "filling_start"
       ],
       "run_summary": {
-        "total_duration_hr": 16.475,
+        "total_duration_hr": 17.387,
         "result_flag": "PASS",
-        "yield_loss_pct": 0.0,
+        "yield_loss_pct": 0.525,
         "scale": "PRODUCTION",
-        "gel_break_time_min": 12.3,
-        "fermentation_time_hr": 12.62,
-        "final_pH": 4.499
+        "gel_break_time_min": 7.6,
+        "fermentation_time_hr": 12.46,
+        "final_pH_offline": 4.502,
+        "d50_um": 28.46
       }
     },
     {
       "story_id": "quark_over_acid",
-      "run_id": "RUN-0165",
+      "run_id": "RUN-0001",
       "product": "QUARK",
-      "scale": "PRODUCTION",
+      "scale": "TECHNIKUM",
       "scenario": "OVER_ACID",
-      "why_selected": "OVER_ACID QUARK — 5 available, scale=PRODUCTION",
+      "why_selected": "OVER_ACID QUARK — 3 available, scale=TECHNIKUM",
       "short_title": "Quark: Over-acidified curd",
-      "narrative": "Culture activity runs faster than target, driving final pH below 4.4. The over-acidified curd shows reduced viscosity and a lower texture score at lab sampling.",
+      "narrative": "Culture activity runs faster than target, driving final pH below 4.4. The over-acidified curd shows reduced viscosity and finer particles (lower d50_um) at lab sampling.",
       "what_to_watch": [
-        "pH: steeper-than-normal slope; final pH in the 4.10–4.35 range",
+        "pH: steeper-than-normal slope; final_pH_offline in the 4.10–4.35 range",
         "fermentation_time_hr: shorter than the NORMAL baseline (~10–11 h)",
-        "lab: viscosity_cP and texture_score below normal range",
-        "result_flag: FAIL on final_pH spec limit"
+        "lab: viscosity_value below normal range; d50_um lower than typical (~18 µm vs ~28 µm)",
+        "result_flag: FAIL on final_pH_offline spec limit"
       ],
       "key_events_expected": [
         "inoculation",
@@ -64,22 +68,23 @@
         "separation_start"
       ],
       "run_summary": {
-        "total_duration_hr": 16.299,
+        "total_duration_hr": 18.023,
         "result_flag": "FAIL",
-        "yield_loss_pct": 17.984,
-        "scale": "PRODUCTION",
-        "gel_break_time_min": 12.8,
-        "fermentation_time_hr": 11.6,
-        "final_pH": 4.343
+        "yield_loss_pct": 17.338,
+        "scale": "TECHNIKUM",
+        "gel_break_time_min": 20.2,
+        "fermentation_time_hr": 11.59,
+        "final_pH_offline": 4.156,
+        "d50_um": 20.37
       }
     },
     {
       "story_id": "quark_stall",
-      "run_id": "RUN-0015",
+      "run_id": "RUN-0088",
       "product": "QUARK",
       "scale": "PRODUCTION",
       "scenario": "STALL_FERMENT",
-      "why_selected": "STALL_FERMENT QUARK — 7 available, scale=PRODUCTION",
+      "why_selected": "STALL_FERMENT QUARK — 2 available, scale=PRODUCTION",
       "short_title": "Quark: Stalled fermentation — run scrapped",
       "narrative": "Acidification halts at pH ~5.5 roughly one-third of the way through late fermentation. The batch is abandoned; yield_loss exceeds 80 % and fermentation_time_hr is recorded as 99 (did-not-complete sentinel).",
       "what_to_watch": [
@@ -93,53 +98,55 @@
         "rennet_addition"
       ],
       "run_summary": {
-        "total_duration_hr": 17.863,
+        "total_duration_hr": 19.52,
         "result_flag": "FAIL",
-        "yield_loss_pct": 96.51,
+        "yield_loss_pct": 99.006,
         "scale": "PRODUCTION",
-        "gel_break_time_min": 23.0,
+        "gel_break_time_min": 23.3,
         "fermentation_time_hr": 99.0,
-        "final_pH": 5.512,
-        "downtime_minutes": 234.1
+        "final_pH_offline": 5.554,
+        "d50_um": 67.78,
+        "downtime_minutes": 230.7
       }
     },
     {
       "story_id": "quark_separation",
-      "run_id": "RUN-0013",
+      "run_id": "RUN-0124",
       "product": "QUARK",
       "scale": "PRODUCTION",
       "scenario": "SEPARATION_ISSUE",
-      "why_selected": "SEPARATION_ISSUE QUARK — 9 available, scale=PRODUCTION",
+      "why_selected": "SEPARATION_ISSUE QUARK — 4 available, scale=PRODUCTION",
       "short_title": "Quark: Centrifuge underperformance",
       "narrative": "Centrifuge back-pressure drifts upward during separation, restricting throughput and reducing whey removal efficiency. Final protein content falls below the 10 % lower spec limit.",
       "what_to_watch": [
         "separation_deltaP: rising trend across the full separation step",
         "flow_rate_lpm: declining as back-pressure increases",
         "anomaly_flag = 1 throughout the separation step",
-        "lab: protein_pct below 10 %; whey_protein_loss_proxy elevated"
+        "lab: protein_pct below 10 %; d50_um elevated (~44 µm vs normal ~28 µm — whey not removed)"
       ],
       "key_events_expected": [
         "gel_break_start",
         "separation_start"
       ],
       "run_summary": {
-        "total_duration_hr": 17.15,
+        "total_duration_hr": 18.381,
         "result_flag": "FAIL",
-        "yield_loss_pct": 8.222,
+        "yield_loss_pct": 13.58,
         "scale": "PRODUCTION",
-        "gel_break_time_min": 23.8,
-        "fermentation_time_hr": 12.83,
-        "final_pH": 4.542,
-        "downtime_minutes": 29.4
+        "gel_break_time_min": 25.0,
+        "fermentation_time_hr": 12.78,
+        "final_pH_offline": 4.55,
+        "d50_um": 35.39,
+        "downtime_minutes": 34.4
       }
     },
     {
       "story_id": "quark_raw_mat",
-      "run_id": "RUN-0005",
+      "run_id": "RUN-0003",
       "product": "QUARK",
       "scale": "PRODUCTION",
       "scenario": "RAW_MAT_VAR",
-      "why_selected": "RAW_MAT_VAR QUARK — 5 available, scale=PRODUCTION",
+      "why_selected": "RAW_MAT_VAR QUARK — 11 available, scale=PRODUCTION",
       "short_title": "Quark: Raw-milk protein variability",
       "narrative": "The incoming milk blend has an off-baseline protein content, which propagates through fermentation rate and into the final product protein level.",
       "what_to_watch": [
@@ -153,44 +160,46 @@
         "rennet_addition"
       ],
       "run_summary": {
-        "total_duration_hr": 17.799,
+        "total_duration_hr": 16.899,
         "result_flag": "PASS",
-        "yield_loss_pct": 2.778,
+        "yield_loss_pct": 3.248,
         "scale": "PRODUCTION",
-        "gel_break_time_min": 23.2,
-        "fermentation_time_hr": 14.05,
-        "final_pH": 4.52
+        "gel_break_time_min": 10.2,
+        "fermentation_time_hr": 12.69,
+        "final_pH_offline": 4.582,
+        "d50_um": 33.91
       }
     },
     {
       "story_id": "pudding_normal",
-      "run_id": "RUN-0007",
+      "run_id": "RUN-0002",
       "product": "HIGH_PROTEIN_PUDDING",
       "scale": "PRODUCTION",
       "scenario": "NORMAL",
-      "why_selected": "NORMAL PUDDING — 59 available, scale=PRODUCTION",
+      "why_selected": "NORMAL PUDDING — 55 available, scale=PRODUCTION",
       "short_title": "Pudding: Clean heat-treatment baseline",
       "narrative": "Mixing, heating, and holding all complete within setpoint tolerances. No fouling signal appears on the heat exchanger; the product reaches fill temperature on target.",
       "what_to_watch": [
         "temperature_C in heating + holding: stable at the 88 °C setpoint",
         "deltaT_heat_exchanger: flat and low (~8–12 °C) — no deposit build-up",
         "fouling_index: near zero across all steps",
-        "lab: fouling_index_end < 0.05 and result_flag = PASS"
+        "lab: d50_um near baseline (~14 µm) and result_flag = PASS"
       ],
       "key_events_expected": [
         "filling_start"
       ],
       "run_summary": {
-        "total_duration_hr": 2.915,
+        "total_duration_hr": 2.959,
         "result_flag": "PASS",
-        "yield_loss_pct": 0.733,
+        "yield_loss_pct": 0.169,
         "scale": "PRODUCTION",
-        "fouling_index_end": 0.018
+        "final_pH_offline": 6.631,
+        "d50_um": 12.99
       }
     },
     {
       "story_id": "pudding_block",
-      "run_id": "RUN-0012",
+      "run_id": "RUN-0068",
       "product": "HIGH_PROTEIN_PUDDING",
       "scale": "PRODUCTION",
       "scenario": "BLOCK",
@@ -207,75 +216,80 @@
         "filling_start"
       ],
       "run_summary": {
-        "total_duration_hr": 2.564,
+        "total_duration_hr": 2.789,
         "result_flag": "PASS",
-        "yield_loss_pct": 3.115,
+        "yield_loss_pct": 6.469,
         "scale": "PRODUCTION",
-        "fouling_index_end": 0.1042,
-        "downtime_minutes": 35.2
+        "final_pH_offline": 6.617,
+        "d50_um": 12.85,
+        "downtime_minutes": 38.6
       }
     },
     {
       "story_id": "pudding_foul_1",
-      "run_id": "RUN-0067",
+      "run_id": "RUN-0110",
       "product": "HIGH_PROTEIN_PUDDING",
       "scale": "PRODUCTION",
       "scenario": "FOUL",
-      "why_selected": "FOUL PUDDING — 2 available, scale=PRODUCTION",
+      "why_selected": "FOUL PUDDING — 5 available, scale=PRODUCTION",
       "short_title": "Pudding: Progressive heat-exchanger fouling",
       "narrative": "Protein and mineral deposits accumulate on heat-exchanger surfaces during heating and holding. The fouling signal builds progressively: outlet temperature drops, back-pressure rises, and deltaT across the exchanger climbs — triggering an extra CIP cycle.",
       "what_to_watch": [
         "fouling_index: ramp from 0 to 0.25–0.55 across the heating + holding steps",
         "deltaT_heat_exchanger: climbing from the ~8 °C baseline toward 15–20 °C",
         "temperature_C: outlet drifting ~4 °C below setpoint as fouling intensifies",
-        "pressure_bar: back-pressure rise of ~0.8 bar; extra_cleaning = 1 in run metadata"
+        "pressure_bar: back-pressure rise of ~0.8 bar; extra_cleaning = 1 in run metadata",
+        "lab: d50_um elevated (~18–21 µm vs normal ~14 µm) from over-gelatinised starch"
       ],
       "key_events_expected": [
         "filling_start"
       ],
       "run_summary": {
-        "total_duration_hr": 3.102,
+        "total_duration_hr": 1.884,
         "result_flag": "PASS",
-        "yield_loss_pct": 4.087,
+        "yield_loss_pct": 4.281,
         "scale": "PRODUCTION",
-        "fouling_index_end": 0.5271,
-        "downtime_minutes": 54.2
+        "final_pH_offline": 6.53,
+        "d50_um": 16.35,
+        "downtime_minutes": 75.0
       }
     },
     {
       "story_id": "pudding_foul_2",
-      "run_id": "RUN-0186",
+      "run_id": "RUN-0009",
       "product": "HIGH_PROTEIN_PUDDING",
       "scale": "TECHNIKUM",
       "scenario": "FOUL",
-      "why_selected": "FOUL PUDDING — only match, scale=TECHNIKUM",
+      "why_selected": "FOUL PUDDING — 4 available, scale=TECHNIKUM",
       "short_title": "Pudding: Progressive heat-exchanger fouling",
       "narrative": "Protein and mineral deposits accumulate on heat-exchanger surfaces during heating and holding. The fouling signal builds progressively: outlet temperature drops, back-pressure rises, and deltaT across the exchanger climbs — triggering an extra CIP cycle.",
       "what_to_watch": [
         "fouling_index: ramp from 0 to 0.25–0.55 across the heating + holding steps",
         "deltaT_heat_exchanger: climbing from the ~8 °C baseline toward 15–20 °C",
         "temperature_C: outlet drifting ~4 °C below setpoint as fouling intensifies",
-        "pressure_bar: back-pressure rise of ~0.8 bar; extra_cleaning = 1 in run metadata"
+        "pressure_bar: back-pressure rise of ~0.8 bar; extra_cleaning = 1 in run metadata",
+        "lab: d50_um elevated (~18–21 µm vs normal ~14 µm) from over-gelatinised starch"
       ],
       "key_events_expected": [
         "filling_start"
       ],
       "run_summary": {
-        "total_duration_hr": 2.174,
+        "total_duration_hr": 2.26,
         "result_flag": "PASS",
-        "yield_loss_pct": 3.575,
+        "yield_loss_pct": 2.649,
         "scale": "TECHNIKUM",
-        "fouling_index_end": 0.518,
-        "downtime_minutes": 35.5
+        "final_pH_offline": 6.633,
+        "d50_um": 17.02,
+        "downtime_minutes": 62.4
       }
     },
     {
       "story_id": "cross_sensor_fault",
-      "run_id": "RUN-0032",
-      "product": "QUARK",
+      "run_id": "RUN-0005",
+      "product": "HIGH_PROTEIN_PUDDING",
       "scale": "PRODUCTION",
       "scenario": "SENSOR_FAULT",
-      "why_selected": "SENSOR_FAULT QUARK — 23 available, scale=PRODUCTION",
+      "why_selected": "SENSOR_FAULT PUDDING — 15 available, scale=PRODUCTION",
       "short_title": "Cross-product: Instrument spike anomalies",
       "narrative": "Intermittent sensor faults produce isolated temperature spikes — either well above or below the expected process range — flagged by anomaly_flag = 1 in the timeseries.",
       "what_to_watch": [
@@ -285,38 +299,38 @@
       ],
       "key_events_expected": [],
       "run_summary": {
-        "total_duration_hr": 16.151,
+        "total_duration_hr": 2.623,
         "result_flag": "PASS",
-        "yield_loss_pct": 0.0,
+        "yield_loss_pct": 0.648,
         "scale": "PRODUCTION",
-        "gel_break_time_min": 19.2,
-        "fermentation_time_hr": 13.38,
-        "final_pH": 4.489
+        "final_pH_offline": 6.694,
+        "d50_um": 16.01
       }
     },
     {
       "story_id": "cross_drift",
-      "run_id": "RUN-0043",
-      "product": "HIGH_PROTEIN_PUDDING",
+      "run_id": "RUN-0007",
+      "product": "QUARK",
       "scale": "PRODUCTION",
       "scenario": "DRIFT",
-      "why_selected": "DRIFT PUDDING — 24 available, scale=PRODUCTION",
-      "short_title": "Pudding: Gradual process drift (FOUL substitute)",
-      "narrative": "Sensor readings drift slowly over the course of the run — temperature creeps upward while flow rate declines — indicating a gradually degrading process condition. Included here as a substitute for a second FOUL example.",
+      "why_selected": "DRIFT QUARK — 28 available, scale=PRODUCTION",
+      "short_title": "Cross-product: Gradual process drift",
+      "narrative": "Process conditions drift slowly across the run: temperature rises and flow rate declines in a time-correlated pattern typical of a gradually degrading process.",
       "what_to_watch": [
-        "temperature_C: slow upward trend visible after ~20 % of run elapsed",
+        "temperature_C: slow upward trend becoming visible after ~20 % of run elapsed",
         "flow_rate_lpm: gradual decline correlated with temperature rise",
-        "anomaly_flag: sparse early in the run, denser toward end"
+        "anomaly_flag: sparse early in the run, denser toward the end"
       ],
-      "key_events_expected": [
-        "filling_start"
-      ],
+      "key_events_expected": [],
       "run_summary": {
-        "total_duration_hr": 3.286,
+        "total_duration_hr": 15.001,
         "result_flag": "PASS",
-        "yield_loss_pct": 0.413,
+        "yield_loss_pct": 1.043,
         "scale": "PRODUCTION",
-        "fouling_index_end": 0.0442
+        "gel_break_time_min": 11.2,
+        "fermentation_time_hr": 13.84,
+        "final_pH_offline": 4.572,
+        "d50_um": 24.91
       }
     }
   ]

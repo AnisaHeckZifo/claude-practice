@@ -80,13 +80,13 @@ _CASE_META: dict[tuple[str, str], dict] = {
         "short_title": "Quark: Over-acidified curd",
         "narrative": (
             "Culture activity runs faster than target, driving final pH below 4.4. "
-            "The over-acidified curd shows reduced viscosity and a lower texture score at lab sampling."
+            "The over-acidified curd shows reduced viscosity and finer particles (lower d50_um) at lab sampling."
         ),
         "what_to_watch": [
-            "pH: steeper-than-normal slope; final pH in the 4.10–4.35 range",
+            "pH: steeper-than-normal slope; final_pH_offline in the 4.10–4.35 range",
             "fermentation_time_hr: shorter than the NORMAL baseline (~10–11 h)",
-            "lab: viscosity_cP and texture_score below normal range",
-            "result_flag: FAIL on final_pH spec limit",
+            "lab: viscosity_value below normal range; d50_um lower than typical (~18 µm vs ~28 µm)",
+            "result_flag: FAIL on final_pH_offline spec limit",
         ],
         "key_events_expected": [
             "inoculation", "rennet_addition", "gel_break_start", "separation_start",
@@ -139,7 +139,7 @@ _CASE_META: dict[tuple[str, str], dict] = {
             "separation_deltaP: rising trend across the full separation step",
             "flow_rate_lpm: declining as back-pressure increases",
             "anomaly_flag = 1 throughout the separation step",
-            "lab: protein_pct below 10 %; whey_protein_loss_proxy elevated",
+            "lab: protein_pct below 10 %; d50_um elevated (~44 µm vs normal ~28 µm — whey not removed)",
         ],
         "key_events_expected": ["gel_break_start", "separation_start"],
         "critical_steps": ["gel_break_mixing", "separation"],
@@ -189,7 +189,7 @@ _CASE_META: dict[tuple[str, str], dict] = {
             "temperature_C in heating + holding: stable at the 88 °C setpoint",
             "deltaT_heat_exchanger: flat and low (~8–12 °C) — no deposit build-up",
             "fouling_index: near zero across all steps",
-            "lab: fouling_index_end < 0.05 and result_flag = PASS",
+            "lab: d50_um near baseline (~14 µm) and result_flag = PASS",
         ],
         "key_events_expected": ["filling_start"],
         "critical_steps": ["heating", "holding"],
@@ -224,6 +224,7 @@ _CASE_META: dict[tuple[str, str], dict] = {
             "deltaT_heat_exchanger: climbing from the ~8 °C baseline toward 15–20 °C",
             "temperature_C: outlet drifting ~4 °C below setpoint as fouling intensifies",
             "pressure_bar: back-pressure rise of ~0.8 bar; extra_cleaning = 1 in run metadata",
+            "lab: d50_um elevated (~18–21 µm vs normal ~14 µm) from over-gelatinised starch",
         ],
         "key_events_expected": ["filling_start"],
         "critical_steps": ["heating", "holding"],
@@ -345,13 +346,13 @@ def _build_run_summary(
     # Quark-specific
     if pd.notna(run["gel_break_time_min"]):
         summary["gel_break_time_min"] = round(float(run["gel_break_time_min"]), 1)
-    if pd.notna(lab["fermentation_time_hr"]):
+    if "fermentation_time_hr" in lab.index and pd.notna(lab["fermentation_time_hr"]):
         summary["fermentation_time_hr"] = round(float(lab["fermentation_time_hr"]), 2)
-    if pd.notna(lab["final_pH"]):
-        summary["final_pH"] = round(float(lab["final_pH"]), 3)
-    # Pudding-specific
-    if pd.notna(lab["fouling_index_end"]):
-        summary["fouling_index_end"] = round(float(lab["fouling_index_end"]), 4)
+    if "final_pH_offline" in lab.index and pd.notna(lab["final_pH_offline"]):
+        summary["final_pH_offline"] = round(float(lab["final_pH_offline"]), 3)
+    # Shared lab fields
+    if "d50_um" in lab.index and pd.notna(lab["d50_um"]):
+        summary["d50_um"] = round(float(lab["d50_um"]), 2)
     # Shared
     if pd.notna(run["downtime_minutes"]) and float(run["downtime_minutes"]) > 0:
         summary["downtime_minutes"] = round(float(run["downtime_minutes"]), 1)
@@ -431,14 +432,28 @@ def _validate_cases(
     for case in cases:
         rid = case["run_id"]
 
-        for label, ids in [
-            ("runs.csv",        ids_runs),
-            ("timeseries.csv",  ids_ts),
-            ("lab_results.csv", ids_lab),
-            ("events.csv",      ids_evts),
+        for label, ids, severity in [
+            ("runs.csv",        ids_runs, "FAIL"),
+            ("timeseries.csv",  ids_ts,   "FAIL"),
+            ("lab_results.csv", ids_lab,  "FAIL"),
+            ("events.csv",      ids_evts, "WARN"),   # filling_packaging is optional for Pudding
         ]:
             if rid not in ids:
-                warnings.append(f"[FAIL] {rid}: absent from {label}")
+                warnings.append(f"[{severity}] {rid}: absent from {label}")
+
+        # Cross-validate story product + scenario against runs.csv
+        if rid in ids_runs:
+            run_row = runs_df[runs_df["run_id"] == rid].iloc[0]
+            if run_row["product"] != case["product"]:
+                warnings.append(
+                    f"[FAIL] {rid}: story product '{case['product']}' "
+                    f"!= runs.csv product '{run_row['product']}'"
+                )
+            if run_row["scenario"] != case["scenario"]:
+                warnings.append(
+                    f"[FAIL] {rid}: story scenario '{case['scenario']}' "
+                    f"!= runs.csv scenario '{run_row['scenario']}'"
+                )
 
         if rid not in ids_ts:
             continue  # can't check steps if timeseries is missing
@@ -459,17 +474,20 @@ def _validate_cases(
 # =============================================================================
 
 def _print_table(cases: list[dict], warnings: list[str]) -> None:
+    col_story    = 28
     col_run      = 12
     col_product  = 22
     col_scenario = 30
+    col_scale    = 12
 
     header = (
+        f"{'story_id':<{col_story}} "
         f"{'run_id':<{col_run}} "
         f"{'product':<{col_product}} "
         f"{'scenario':<{col_scenario}} "
-        f"why selected"
+        f"{'scale':<{col_scale}}"
     )
-    sep = "-" * min(len(header), 100)
+    sep = "-" * len(header)
 
     print(f"\n-- Demo case selection ({len(cases)} runs) --")
     print(header)
@@ -478,10 +496,11 @@ def _print_table(cases: list[dict], warnings: list[str]) -> None:
     for c in cases:
         prod_short = c["product"].replace("HIGH_PROTEIN_PUDDING", "PUDDING")
         print(
+            f"{c['story_id']:<{col_story}} "
             f"{c['run_id']:<{col_run}} "
             f"{prod_short:<{col_product}} "
             f"{c['scenario']:<{col_scenario}} "
-            f"{c['why_selected']}"
+            f"{c['scale']:<{col_scale}}"
         )
 
     if warnings:
