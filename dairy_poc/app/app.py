@@ -2046,14 +2046,18 @@ def render_main(
     selected_step = st.session_state.get(f"step_zoom_{run_id}", "full_run")
     show_baseline = st.session_state.get(f"baseline_{run_id}", False)
 
-    # Resolve baseline DataFrame (mirrors logic in render_signal_charts)
-    df_baseline: pd.DataFrame | None = None
-    if show_baseline:
-        run_meta = runs[runs["run_id"] == run_id]
-        scale    = str(run_meta["scale"].iloc[0]) if not run_meta.empty else "PRODUCTION"
-        b_rid    = _find_baseline_run_id(runs, run_row["product"], scale)
-        if b_rid:
-            df_baseline = ts[ts["run_id"] == b_rid].copy()
+    # Resolve NORMAL reference run for this product+scale.
+    # df_baseline_ref is always computed (used by narrative builder regardless of toggle).
+    # df_baseline is gated on the show_baseline toggle (drives the visual comparison panel).
+    _scale           = str(run_row.get("scale", "PRODUCTION"))
+    b_rid            = _find_baseline_run_id(runs, run_row["product"], _scale)
+    df_baseline_ref:  pd.DataFrame | None = None
+    baseline_lab_row: pd.Series   | None = None
+    if b_rid:
+        df_baseline_ref = ts[ts["run_id"] == b_rid]
+        _bl_sub = lab[lab["run_id"] == b_rid]
+        baseline_lab_row = _bl_sub.iloc[0] if not _bl_sub.empty else None
+    df_baseline: pd.DataFrame | None = df_baseline_ref if show_baseline else None
 
     # Resolve x_range from step-zoom state (mirrors logic in render_signal_charts)
     windows = _compute_step_windows(run_ts)
@@ -2067,11 +2071,64 @@ def render_main(
         else:
             x_range = None
 
+    # Pre-compute narrative bullets in guided mode (pure, before any Streamlit widget).
+    narrative_bullets: list[str] = []
+    if mode == "guided" and story is not None:
+        _product     = str(run_row["product"])
+        _signals     = _QUARK_SIGNALS if _product == "QUARK" else _PUDDING_SIGNALS
+        _ew_statuses = _compute_ew_statuses(run_ts, _product)
+        _div_steps   = (
+            _analyze_step_divergence(run_ts, df_baseline_ref, _signals)
+            if df_baseline_ref is not None
+            else []
+        )
+        _mq_rows     = _compute_measurement_quality(run_ts, _product)
+        narrative_bullets = build_guided_narrative(
+            run_row          = run_row,
+            selected_step    = selected_step,
+            lab_row          = lab_row,
+            baseline_lab_row = baseline_lab_row,
+            ew_statuses      = _ew_statuses,
+            divergence_steps = _div_steps,
+            mq_rows          = _mq_rows,
+            story            = story,
+        )
+
     # Build two-column layout: main content | right panel
     col_main, col_right = st.columns([2, 1], gap="large")
 
     with col_main:
         _render_run_header(run_row, story)
+
+        # ── TEMPORARY DEBUG (guided mode only) ───────────────────────────────
+        if mode == "guided" and story is not None:
+            with st.expander("Debug: story + narrative source (temporary)", expanded=False):
+                st.markdown("**Story object (demo_cases.json)**")
+                st.json({
+                    k: story.get(k)
+                    for k in ("story_id", "run_id", "product", "scenario", "scale",
+                              "short_title", "narrative", "what_to_watch",
+                              "why_selected", "rank_detail")
+                    if k in story
+                })
+                st.markdown("**Run metadata (runs.csv)**")
+                st.json({
+                    "run_id":   run_row["run_id"],
+                    "product":  run_row["product"],
+                    "scenario": run_row["scenario"],
+                    "scale":    run_row["scale"],
+                })
+                st.markdown("**Narrative source**")
+                st.info(
+                    "Computed (live) — build_guided_narrative() runs on every rerender. "
+                    "Static story fields (narrative, what_to_watch) are in 'Story notes (static)' expander."
+                )
+                if narrative_bullets:
+                    st.markdown("**Computed bullets:**")
+                    for b in narrative_bullets:
+                        st.markdown(f"- {b}")
+        # ── END TEMPORARY DEBUG ───────────────────────────────────────────────
+
         _render_process_timeline(run_ts, run_evts, selected_step)
         _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
         _render_score_trend_chart(run_ts, run_row["product"], run_evts, x_range, selected_step, run_id)
@@ -2080,7 +2137,8 @@ def render_main(
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
-        _render_right_panel(mode, run_row, lab_row, story, df_run=run_ts)
+        _render_right_panel(mode, run_row, lab_row, story, df_run=run_ts,
+                            narrative_bullets=narrative_bullets)
         if df_baseline is not None:
             _render_divergence_panel(
                 run_ts, df_baseline, run_row["product"], x_range, selected_step,
@@ -2570,14 +2628,190 @@ def _render_divergence_panel(
         )
 
 
+# =============================================================================
+# GUIDED NARRATIVE  (computed, data-driven)
+# =============================================================================
+
+_LAB_DELTA_FIELDS: list[tuple[str, str, str]] = [
+    ("protein_pct",      "protein",      "{:+.2f} %"),
+    ("total_solids_pct", "total solids", "{:+.2f} %"),
+    ("viscosity_value",  "viscosity",    "{:+.0f} cP"),
+    ("final_pH_offline", "pH (offline)", "{:+.3f}"),
+    ("d50_um",           "D50",          "{:+.1f} µm"),
+]
+
+
+def _compute_ew_statuses(run_ts: pd.DataFrame, product: str) -> dict:
+    """Return EW score results as a plain dict for narrative use."""
+    if not _SKLEARN_AVAILABLE or run_ts.empty:
+        return {}
+    if product == "QUARK":
+        return {
+            "ferm": _compute_quark_ferm_score(run_ts),
+            "sep":  _compute_quark_sep_score(run_ts),
+        }
+    return {"run": _compute_ml_run_score(run_ts, product)}
+
+
+def _lab_delta_bullets(
+    lab_row:          "pd.Series | None",
+    baseline_lab_row: "pd.Series | None",
+) -> list[str]:
+    """Return ≤2 lab delta strings (highest absolute magnitude first)."""
+    if lab_row is None or baseline_lab_row is None:
+        return []
+    deltas: list[tuple[float, str, str]] = []
+    for col, label, fmt_str in _LAB_DELTA_FIELDS:
+        try:
+            v_run  = float(lab_row.get(col, np.nan))
+            v_base = float(baseline_lab_row.get(col, np.nan))
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(v_run) or pd.isna(v_base):
+            continue
+        delta = v_run - v_base
+        deltas.append((abs(delta), label, fmt_str.format(delta)))
+    deltas.sort(key=lambda x: x[0], reverse=True)
+    return [f"{label} {val}" for _, label, val in deltas[:2]]
+
+
+def build_guided_narrative(
+    run_row:          pd.Series,
+    selected_step:    str,
+    lab_row:          "pd.Series | None",
+    baseline_lab_row: "pd.Series | None",
+    ew_statuses:      dict,
+    divergence_steps: list[dict],
+    mq_rows:          list[dict],
+    story:            "dict | None" = None,
+) -> list[str]:
+    """Return ≤5 short engineer-friendly bullets describing the current run.
+
+    Language rule: use 'observed', 'diverges', 'consistent with',
+    'downstream manifestation'. Never use 'caused by', 'root cause',
+    'primary driver'.
+    """
+    bullets: list[str] = []
+    product = str(run_row.get("product", ""))
+
+    first_div: dict | None = next((s for s in divergence_steps if s["diverges"]), None)
+
+    # ── Bullet 1: Focus step ─────────────────────────────────────────────────
+    if selected_step != "full_run":
+        focus_label = selected_step.replace("_", " ")
+    elif first_div is not None:
+        focus_label = first_div["step"].replace("_", " ")
+    else:
+        focus_label = "full run"
+    bullets.append(f"Focus step: {focus_label}")
+
+    # ── Bullet 2: What changes first ─────────────────────────────────────────
+    if first_div is not None:
+        top_sigs = sorted(
+            [s for s in first_div["sigs"] if s["diverges"]],
+            key=lambda s: max(s["z_mean"], s["z_drift"]),
+            reverse=True,
+        )
+        if top_sigs:
+            sig       = top_sigs[0]
+            step_lbl  = first_div["step"].replace("_", " ")
+            direction = "higher" if sig["mean_diff"] > 0 else "lower"
+            slope_note = ""
+            if sig["z_drift"] > _Z_THRESH:
+                slope_note = (
+                    " with a steeper acidification slope"
+                    if sig["col"] == "pH" and sig["slope_diff"] < 0
+                    else " with a diverging trend"
+                )
+            bullets.append(
+                f"What changes first: {sig['label']} observed {direction} than reference"
+                f" ({sig['mean_diff']:+.3g} {sig['unit']}) at {step_lbl}"
+                + (slope_note + ", consistent with altered process progression." if slope_note else ".")
+            )
+        else:
+            bullets.append(
+                "What changes first: signals consistent with reference across all monitored steps."
+            )
+    elif divergence_steps:
+        bullets.append(
+            "What changes first: no significant divergence from reference observed across all steps."
+        )
+    else:
+        # No baseline available — fall back to EW status
+        ew_parts: list[str] = []
+        if product == "QUARK":
+            for key, lbl in [("ferm", "Fermentation Early Warning"), ("sep", "Separation Early Warning")]:
+                res = ew_statuses.get(key)
+                if res is not None:
+                    status, _ = _score_status(res[0])
+                    if status != "Normal":
+                        ew_parts.append(f"{lbl} at {status}")
+        else:
+            res = ew_statuses.get("run")
+            if res is not None:
+                status, _ = _score_status(res[0])
+                if status != "Normal":
+                    ew_parts.append(f"Early Warning at {status}")
+        if ew_parts:
+            bullets.append(
+                f"What changes first: {'; '.join(ew_parts)} — "
+                "no reference run available for step-level comparison."
+            )
+        else:
+            bullets.append("What changes first: Early Warning signals within normal range.")
+
+    # ── Bullet 3: What follows (downstream manifestation, optional) ───────────
+    downstream = [s for s in divergence_steps if s["diverges"] and s is not first_div]
+    if downstream:
+        ds      = downstream[0]
+        ds_sigs = sorted(
+            [s for s in ds["sigs"] if s["diverges"]],
+            key=lambda s: s["z_mean"],
+            reverse=True,
+        )
+        if ds_sigs:
+            sig      = ds_sigs[0]
+            step_lbl = ds["step"].replace("_", " ")
+            direction = "higher" if sig["mean_diff"] > 0 else "lower"
+            bullets.append(
+                f"What follows: downstream manifestation at {step_lbl} — "
+                f"{sig['label']} observed {direction} than reference "
+                f"({sig['mean_diff']:+.3g} {sig['unit']})."
+            )
+
+    # ── Bullet 4: Lab outcome shift ───────────────────────────────────────────
+    lab_parts = _lab_delta_bullets(lab_row, baseline_lab_row)
+    if lab_parts:
+        bullets.append(f"Lab outcome shift: {'; '.join(lab_parts)}.")
+    elif lab_row is not None:
+        flag = str(lab_row.get("result_flag", "unknown"))
+        bullets.append(f"Lab outcome shift: result flag = {flag} (no reference lab for delta).")
+
+    # ── Bullet 5: Measurement note (conditional) ──────────────────────────────
+    mq_flagged = [r for r in mq_rows if r["status"] in ("Suspect", "Poor")]
+    is_sensor_fault = story is not None and story.get("story_id") == "cross_sensor_fault"
+    if mq_flagged:
+        parts = [r["triggered"] for r in mq_flagged if r["triggered"]][:2]
+        if parts:
+            bullets.append(f"Measurement note: {'; '.join(parts)}.")
+    elif is_sensor_fault:
+        bullets.append(
+            "Measurement note: this story highlights measurement integrity — "
+            "check the Measurement Quality panel for details."
+        )
+
+    return bullets[:5]
+
+
 # ── Right panel ───────────────────────────────────────────────────────────────
 
 def _render_right_panel(
-    mode:    str,
-    run_row: pd.Series,
-    lab_row: pd.Series | None,
-    story:   dict | None,
-    df_run:  pd.DataFrame | None = None,
+    mode:              str,
+    run_row:           pd.Series,
+    lab_row:           pd.Series | None,
+    story:             dict | None,
+    df_run:            pd.DataFrame | None = None,
+    narrative_bullets: "list[str] | None"  = None,
 ) -> None:
     # Outcomes
     st.subheader("Run outcomes")
@@ -2630,15 +2864,25 @@ def _render_right_panel(
         else:
             st.info("No lab result for this run.")
 
-    # Narrative (guided mode only)
+    # Narrative (guided mode only) — computed from live run data
     if mode == "guided" and story is not None:
         st.subheader("Process narrative")
         with st.container(border=True):
-            st.write(story["narrative"])
-            if story.get("what_to_watch"):
-                st.markdown("**What to watch:**")
-                for bullet in story["what_to_watch"]:
-                    st.markdown(f"- {bullet}")
+            if narrative_bullets:
+                for b in narrative_bullets:
+                    st.markdown(f"- {b}")
+            else:
+                st.caption("Narrative not available for this run.")
+            static_narrative = story.get("narrative", "")
+            static_watch     = story.get("what_to_watch", [])
+            if static_narrative or static_watch:
+                with st.expander("Story notes (static)", expanded=False):
+                    if static_narrative:
+                        st.write(static_narrative)
+                    if static_watch:
+                        st.markdown("**What to watch:**")
+                        for bullet in static_watch:
+                            st.markdown(f"- {bullet}")
 
 
 def _render_lab_metrics(lab_row: pd.Series, product: str) -> None:  # noqa: ARG001
