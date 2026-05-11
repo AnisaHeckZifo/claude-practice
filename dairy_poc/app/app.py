@@ -2100,35 +2100,6 @@ def render_main(
     with col_main:
         _render_run_header(run_row, story)
 
-        # ── TEMPORARY DEBUG (guided mode only) ───────────────────────────────
-        if mode == "guided" and story is not None:
-            with st.expander("Debug: story + narrative source (temporary)", expanded=False):
-                st.markdown("**Story object (demo_cases.json)**")
-                st.json({
-                    k: story.get(k)
-                    for k in ("story_id", "run_id", "product", "scenario", "scale",
-                              "short_title", "narrative", "what_to_watch",
-                              "why_selected", "rank_detail")
-                    if k in story
-                })
-                st.markdown("**Run metadata (runs.csv)**")
-                st.json({
-                    "run_id":   run_row["run_id"],
-                    "product":  run_row["product"],
-                    "scenario": run_row["scenario"],
-                    "scale":    run_row["scale"],
-                })
-                st.markdown("**Narrative source**")
-                st.info(
-                    "Computed (live) — build_guided_narrative() runs on every rerender. "
-                    "Static story fields (narrative, what_to_watch) are in 'Story notes (static)' expander."
-                )
-                if narrative_bullets:
-                    st.markdown("**Computed bullets:**")
-                    for b in narrative_bullets:
-                        st.markdown(f"- {b}")
-        # ── END TEMPORARY DEBUG ───────────────────────────────────────────────
-
         _render_process_timeline(run_ts, run_evts, selected_step)
         _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
         _render_score_trend_chart(run_ts, run_row["product"], run_evts, x_range, selected_step, run_id)
