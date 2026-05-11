@@ -64,6 +64,30 @@ def load_demo_cases() -> dict:
         return json.load(fh)
 
 
+def _check_demo_cases_sync(demo_cases: dict, runs: pd.DataFrame) -> list[dict]:
+    """Return one dict per story that is out of sync with runs.csv (empty = all OK)."""
+    run_index = runs.set_index("run_id")[["product", "scenario"]]
+    issues: list[dict] = []
+    for story in demo_cases.get("stories", []):
+        sid = story.get("story_id", "?")
+        rid = story.get("run_id", "")
+        if rid not in run_index.index:
+            issues.append({"story_id": sid, "run_id": rid, "field": "run_id", "issue": "not in runs.csv"})
+            continue
+        row = run_index.loc[rid]
+        if row["product"] != story.get("product"):
+            issues.append({
+                "story_id": sid, "run_id": rid, "field": "product",
+                "issue": f"story={story.get('product')}  runs={row['product']}",
+            })
+        if row["scenario"] != story.get("scenario"):
+            issues.append({
+                "story_id": sid, "run_id": rid, "field": "scenario",
+                "issue": f"story={story.get('scenario')}  runs={row['scenario']}",
+            })
+    return issues
+
+
 # =============================================================================
 # SIGNAL CHARTS
 # =============================================================================
@@ -1602,8 +1626,9 @@ def _render_similar_runs_panel(
 # =============================================================================
 
 def render_sidebar(
-    runs:       pd.DataFrame,
-    demo_cases: dict,
+    runs:        pd.DataFrame,
+    demo_cases:  dict,
+    sync_issues: list[dict] | None = None,
 ) -> tuple[str, str | None]:
     """
     Render sidebar controls.
@@ -1615,16 +1640,34 @@ def render_sidebar(
     """
     st.sidebar.title("Controls")
 
+    if sync_issues:
+        st.sidebar.error(
+            "Guided story list is out of sync with the current dataset.  \n"
+            "Please regenerate demo_cases.json."
+        )
+        with st.sidebar.expander("Sync issues", expanded=False):
+            st.dataframe(
+                pd.DataFrame(sync_issues),
+                hide_index=True,
+                use_container_width=True,
+            )
+
     mode = st.sidebar.radio(
         "Mode",
         options=["Guided story mode", "Explore all runs"],
         key="app_mode",
+        disabled=bool(sync_issues),
         help=(
             "Guided: step through curated demo cases with process narratives.\n"
             "Explore: browse any run in the dataset."
         ),
     )
-    guided = mode == "Guided story mode"
+
+    # Force explore when stories are out of sync
+    guided = (mode == "Guided story mode") and not sync_issues
+
+    if sync_issues:
+        st.sidebar.caption("Guided mode unavailable until demo_cases.json is regenerated.")
 
     st.sidebar.divider()
 
@@ -2451,7 +2494,9 @@ def main() -> None:
     events     = load_events()
     demo_cases = load_demo_cases()
 
-    mode, run_id = render_sidebar(runs, demo_cases)
+    sync_issues = _check_demo_cases_sync(demo_cases, runs)
+
+    mode, run_id = render_sidebar(runs, demo_cases, sync_issues)
     render_main(mode, run_id, runs, ts, lab, events, demo_cases)
 
 
