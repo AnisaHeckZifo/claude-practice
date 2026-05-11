@@ -1847,6 +1847,19 @@ def render_sidebar(
     else:
         run_id = _sidebar_explore(runs)
 
+    st.sidebar.divider()
+    st.sidebar.markdown("**Advanced panels**")
+    st.sidebar.toggle(
+        "Show soft sensor predictions (advanced)",
+        key="show_soft_sensor",
+        value=False,
+    )
+    st.sidebar.toggle(
+        "Show similar runs (advanced)",
+        key="show_similar_runs",
+        value=False,
+    )
+
     return ("guided" if guided else "explore"), run_id
 
 
@@ -2060,8 +2073,9 @@ def render_main(
     with col_main:
         _render_run_header(run_row, story)
         _render_process_timeline(run_ts, run_evts, selected_step)
-        _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
-        _render_score_trend_chart(run_ts, run_row["product"], run_evts, x_range, selected_step, run_id)
+        if st.session_state.get("show_soft_sensor", False):
+            _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
+            _render_score_trend_chart(run_ts, run_row["product"], run_evts, x_range, selected_step, run_id)
         _render_measurement_quality_panel(run_ts, run_row["product"], story)
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
@@ -2071,7 +2085,8 @@ def render_main(
             _render_divergence_panel(
                 run_ts, df_baseline, run_row["product"], x_range, selected_step,
             )
-        _render_similar_runs_panel(run_id, mode, runs, ts, demo_cases)
+        if st.session_state.get("show_similar_runs", False):
+            _render_similar_runs_panel(run_id, mode, runs, ts, demo_cases)
 
 
 # ── Run header ────────────────────────────────────────────────────────────────
