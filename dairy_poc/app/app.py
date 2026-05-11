@@ -1854,6 +1854,11 @@ def render_sidebar(
         key="show_similar_runs",
         value=False,
     )
+    st.sidebar.toggle(
+        "Show measurement quality (advanced)",
+        key="show_measurement_quality",
+        value=False,
+    )
 
     return ("guided" if guided else "explore"), run_id
 
@@ -2070,7 +2075,8 @@ def render_main(
         _render_process_timeline(run_ts, run_evts, selected_step)
         _render_ml_score_panel(run_ts, run_row["product"], x_range, selected_step, run_id)
         _render_score_trend_chart(run_ts, run_row["product"], run_evts, x_range, selected_step, run_id)
-        _render_measurement_quality_panel(run_ts, run_row["product"], story)
+        if st.session_state.get("show_measurement_quality", False):
+            _render_measurement_quality_panel(run_ts, run_row["product"], story)
         render_signal_charts(run_ts, run_row["product"], run_evts, runs, ts)
 
     with col_right:
